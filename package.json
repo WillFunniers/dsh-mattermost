@@ -1,0 +1,18 @@
+{
+  "name": "dsh-mattermost",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mattermost <-> DSH native messaging entry: Mattermost WebSocket in, in-process DSH agent, session/event out.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

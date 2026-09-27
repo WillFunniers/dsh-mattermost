@@ -1,0 +1,36 @@
+# dsh-mattermost: reuses the existing DSH process (no second application process).
+# Mattermost becomes a task entry point; DSH keeps owning the session/agent runtime.
+#
+# Every value is env-driven with production-appropriate defaults. There is no
+# test path, no test channel and no self-message bypass anywhere in this file.
+- insert:
+    - id: mattermost
+      name: dsh-mattermost
+      config:
+        baseUrl: !!js process.env.MATTERMOST_URL || ''
+        tokenRef: MATTERMOST_TOKEN
+        cwd: !!js process.env.MATTERMOST_CWD || '$WORKDIR'
+
+        # Empty = every channel the bot is in. Production should list them.
+        channels: !!js (process.env.MATTERMOST_CHANNELS || '').split(',').filter(Boolean)
+        # Channels that answer without an @mention. Production should stay empty.
+        freeResponseChannels: !!js (process.env.MATTERMOST_FREE || '').split(',').filter(Boolean)
+        requireMention: true
+
+        # Default-deny user authorization.
+        allowedUsers: !!js (process.env.MATTERMOST_ALLOWED_USERS || '').split(',').filter(Boolean)
+        allowAll: !!js process.env.MATTERMOST_ALLOW_ALL === '1'
+
+        # Bot-to-bot loop budget (same semantics as the production bridge).
+        allowBotMentions: !!js process.env.MATTERMOST_ALLOW_BOT_MENTIONS !== '0'
+        botChainMax: !!js Number(process.env.MATTERMOST_BOT_CHAIN_MAX || 5)
+        botChainWindowMs: !!js Number(process.env.MATTERMOST_BOT_CHAIN_WINDOW_MS || 120000)
+
+        # Idle live-agent eviction (sessions themselves stay durable).
+        idleAgentTtlMs: !!js Number(process.env.MATTERMOST_IDLE_TTL_MS || 1800000)
+        idleSweepIntervalMs: !!js Number(process.env.MATTERMOST_SWEEP_MS || 60000)
+
+        # Empty = $DSH_HOME/mattermost.
+        stateDir: !!js process.env.MATTERMOST_STATE_DIR || ''
+        backfill: true
+        debug: !!js process.env.MATTERMOST_DEBUG === '1'
