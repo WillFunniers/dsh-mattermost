@@ -1,0 +1,16 @@
+# Environment-specific dependency link (points into the local DSH install)
+node_modules/
+
+# Secrets and credentials — never commit these
+.env
+*.env
+*.token
+*.secret
+credentials/
+secrets/
+cookies/
+
+# Logs and test output
+*.log
+playwright-report/
+test-results/
