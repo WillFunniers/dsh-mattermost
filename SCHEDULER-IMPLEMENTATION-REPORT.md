@@ -292,34 +292,58 @@ Production was never touched.
 | T8 | 5 jobs / 2 sessions, isolation, independent dispatch | PASS |
 | T9 | duplicate protection (delivered + crash window) | PASS |
 | T10 | executes while Mattermost disconnected | PASS |
-| T11 | busy session → followup, never steer | PASS (see caveat) |
+| T11 | busy session → followup, never steer | PASS (precondition verified) |
 | T12 | session with no live agent → resume | PASS |
 | T13 | cross-session cancel/list refused | PASS |
 | T14 | bot-chain unchanged | PASS |
 | T15 | corruption / partial write / **schema change** | PASS |
 | T16 | offline backlog drained in bounded batches | PASS |
+| T19 | **agent-invoked `schedule_job`** (real agent, not the probe) | PASS |
+| T20 | **agent-invoked `cancel_job`**, session-fenced | PASS |
 
-**Totals:** 42/42 (`run_full.log`), 7/7 eviction replay (`run_eviction.log`), 49 assertions,
-0 failures, 0 skips.
+**Totals:** final regression `run_final.log` = **52 pass / 0 fail / 1 skip** (T1–T20, the skip
+being one cosmetic T15 sub-assertion noted below), plus 7/7 on the eviction replay
+(`run_eviction.log`). Earlier runs for the record: 42/42 (`run_full.log`), and 8/8 + 1 skip
+(`run_tools.log`) before the T11 fix.
 
-**Honest caveat on T11.** The assertion that the scheduler never steers is structural — the
-dispatch path contains no `steer` call at all — and dispatch into a session mid-turn was
-observed. But the *precondition* (agent `running` at the instant the job lands) was not
-reliably established in the automated run; one run showed `before=idle`. The test therefore
-proves "the scheduler uses followup", not "followup was exercised against a genuinely busy
-agent". Treat the busy-agent queueing semantics as inherited from the already-verified
-`handlePost` path rather than freshly proven here.
+The T15 skip is honest and benign: the synthetic corruption test confirms the corrupt
+document was preserved and the unit still opened, but this run produced no explicit
+`backup` line in the plugin log, so the test reports a skip rather than asserting something
+it did not observe. The stronger evidence for this policy is the **real** schema-change case
+in §7 (14 records moved aside, logged and counted).
+
+**T19/T20 close a real gap.** Every earlier test reached the job store through the probe's
+HTTP surface, which meant the *agent-facing tools* — the whole user-visible interface — were
+unverified. T19 now drives a real agent: it calls `schedule_job`, the job appears with the
+requested type/payload and `createdBy` resolved from the session (not the caller's
+environment), fires when due, and the reminder is delivered to Mattermost. T20 has the agent
+schedule then cancel, and confirms `cancelledBy` equals the calling session id.
+
+**T11 was fixed, not waved through.** An earlier revision slept 10 s and checked once, then
+passed an assertion while the precondition was false: the agent had run `sleep 60 &` in the
+background and was `idle`, so nothing was ever queued into a busy agent. The test now forbids
+backgrounding, polls up to 60 s for a genuinely `running` agent, and reports
+`agentRunning=true turn=followup` from the dispatch log. That log field was added specifically
+to make the claim falsifiable — without it the assertion could not fail. Final result:
+
+```
+PASS  T11 precondition: agent genuinely running (verified, not assumed)
+PASS  T11 dispatched with agentRunning=true and turn=followup (queued, never steered)
+```
 
 ## 16. Test Results — Evidence Files
 
 ```
 scheduler-test/evidence/
-  run_full.log                42/42 assertions
+  run_final.log                final regression: T1-T20
+  run_full.log                 first full pass (42/42)
+  run_tools.log                tool surface, before the T11 fix
   run_eviction.log             7/7  incident replay, real eviction
   t6_eviction_evidence.txt     raw eviction → resume → dispatch log lines
   t15_backup_and_skip.txt      14 schema-invalid records moved aside, unit opened
-  run_perf.log                 performance table
+  run_perf.log                 performance run
   perf_table.txt / perf_startup.txt
+  FINAL-SUMMARY.txt            one-page roll-up
   summary.txt
 ```
 
@@ -341,6 +365,20 @@ scheduler-test/evidence/
 
 **Verdict: no optimisation needed and none attempted.** JSON-domain storage is comfortably
 adequate at this scale; SQLite would be premature.
+
+### 17.1 Long-run stability
+
+The isolated harness ran unattended for ~7 hours with the scheduler live:
+
+```
+ticks      : 5,032          (5 s interval ≈ 7 h — the loop never stalled)
+RSS        : 174.1 MB       (with 0 jobs; 316.8 MB with 1,060 jobs)
+open FDs   : 26
+threads    : 11
+```
+
+No tick failures, no leaked file descriptors, no unbounded growth. Every tick is an
+in-memory scan, so an idle scheduler with no due jobs is close to free.
 
 ## 18. Production Verification
 
@@ -364,7 +402,9 @@ adequate at this scale; SQLite would be premature.
    (then catch-up applies).
 6. Only sessions the plugin maps to a Mattermost target can schedule deliverable work.
 7. The scheduler shares `dsh-web`'s fault domain, as the whole plugin does.
-8. Busy-agent queueing is inherited from the existing path, not freshly stress-tested (§15).
+8. The busy-agent precondition depends on the model cooperating: if it backgrounds the
+   command, no busy turn is produced. The test polls and reports a skip honestly in that
+   case rather than passing on an unverified premise.
 9. `maxDispatchPerTick` bounds a backlog per tick; a very large backlog drains over several
    ticks rather than instantly (by design).
 
@@ -420,6 +460,5 @@ mismatch, plus the 04:00 restart finding and the `NRestarts=0` caveat.
    it should be a documented one, and its interruption of live agents recorded in the runbook.
 5. **Reconsider core `dsh-schedule` integration** if it ever exposes a service and an
    out-of-session delivery mode — this plugin's wake driver could then be retired.
-6. **Stress the busy-agent path** with a deterministic busy precondition (§15 caveat).
-7. **Consolidate the persisted dedup set.** `mattermost.js` keeps a 5,000-entry seen-set for
+6. **Consolidate the persisted dedup set.** `mattermost.js` keeps a 5,000-entry seen-set for
    backfill; a durable, bounded alternative would survive restarts.
