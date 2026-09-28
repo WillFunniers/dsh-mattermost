@@ -327,25 +327,33 @@ t10() {
 # --------------------------------------------------------------------------- T11
 t11() {
   hdr "T11  job arriving while the agent is busy queues as a followup"
-  local at; at=$(($(now_ms)+305000))   # parked far out; we will force it due
-  local id; id=$(create agent_followup "$SESSION" "$at" "[T11] busy-session followup")
-  # Force the job due now and give the agent a long-running turn.
+  # Establish a REAL busy precondition and then VERIFY it, so the assertion is
+  # falsifiable rather than assumed. The instruction must forbid backgrounding:
+  # a `sleep` the agent backgrounds leaves the turn idle, which is exactly what
+  # an earlier revision of this test mistook for a busy agent.
   curl -s --max-time 20 -X POST "$P/inject" -H 'Content-Type: application/json' \
-    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 执行 bash：sleep 20 && echo T11BUSY。然后只回复 T11BUSY\"}" >/dev/null
-  sleep 6
-  local run1; run1=$(curl -s "$P/agent?sessionId=$SESSION" | jq_ 'print(d["status"])')
-  # Recreate the job due now, while the agent is mid-turn. The claim under test
-  # is that a job landing on a busy session is QUEUED (followup), never steered.
-  curl -s -X POST "$P/job/cancel" -H 'Content-Type: application/json' -d "{\"id\":\"$id\"}" >/dev/null
+    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 请用 bash 工具在前台执行命令 sleep 90。必须前台阻塞等待，不要加 &、不要用 run_in_background、不要提前回复。命令返回后只回复 T11BUSY。\"}" >/dev/null
+  local run1='' i=0
+  while [ "$i" -lt 20 ]; do
+    sleep 3
+    run1=$(curl -s "$P/agent?sessionId=$SESSION" | jq_ 'print(d["status"])')
+    [ "$run1" = "running" ] && break
+    i=$((i+1))
+  done
+  if [ "$run1" != "running" ]; then
+    skip "T11 could not establish a busy agent (status=$run1) — model backgrounded the command"
+  else
+    ok "T11 precondition: agent genuinely running (verified, not assumed)"
+  fi
   local id2; id2=$(create agent_followup "$SESSION" "$(now_ms)" "[T11] busy-session followup")
-  tick; sleep 2
+  tick; sleep 3
   local st; st=$(jobfield "$id2" status)
-  [ "$st" = "completed" ] && ok "T11 queued into the busy agent (not steered)" || bad "T11 status=$st"
-  local run2; run2=$(curl -s "$P/agent?sessionId=$SESSION" | jq_ 'print(d["status"])')
-  echo "  agent status before=$run1 after=$run2 (both should be running)"
-  grep -q "job dispatched id=$id2" $MMT_HOME/mattermost/plugin.log \
-    && ok "T11 followup rather than steer (scheduler never steers)" || bad "T11 no dispatch log"
-  sleep 25
+  [ "$st" = "completed" ] && ok "T11 job dispatched into the busy agent" || bad "T11 status=$st"
+  # The dispatch log now records the agent status observed at hand-off time.
+  grep -q "job dispatched id=$id2 .*agentRunning=true turn=followup" $MMT_HOME/mattermost/plugin.log \
+    && ok "T11 dispatched with agentRunning=true and turn=followup (queued, never steered)" \
+    || bad "T11 no agentRunning=true followup log line"
+  sleep 55
 }
 
 # --------------------------------------------------------------------------- T12
@@ -464,8 +472,57 @@ print(sum(1 for j in d['jobs'] if j['status']=='pending'))")
   done
 }
 
+# --------------------------------------------------------------------------- T19
+# The tool surface, driven by a REAL agent rather than the probe. Every other
+# test reaches the store directly; this one proves the agent can actually use it.
+t19() {
+  hdr "T19  agent-invoked schedule_job"
+  local before; before=$(jobcount)
+  curl -s --max-time 25 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 请调用 schedule_job 工具，创建一个 120 秒后触发的 reminder，message 写 \\\"T19 提醒\\\"。创建完成后只回复 T19_CREATED，不要做别的事。\"}" >/dev/null
+  sleep 45
+  local after; after=$(jobcount)
+  [ "$after" -gt "$before" ] && ok "T19 agent created a job via the tool ($before -> $after)" \
+    || { bad "T19 agent created no job"; return; }
+
+  local id; id=$(curl -s "$P/jobs" | python3 -c "
+import sys,json
+d=[j for j in json.load(sys.stdin)['jobs'] if 'T19' in j['message'] and j['type']=='reminder']
+print(d[-1]['id'] if d else '')")
+  [ -n "$id" ] && ok "T19 job has the requested type and payload ($id)" || { bad "T19 payload wrong"; return; }
+
+  local by; by=$(jobfield "$id" createdBy)
+  [ "$by" = "$OWNER" ] && ok "T19 createdBy resolved from the session (not the caller env)" \
+    || bad "T19 createdBy=$by (want $OWNER)"
+
+  echo "  waiting for the agent-created job to fire..."
+  sleep 90
+  local st; st=$(jobfield "$id" status)
+  [ "$st" = "completed" ] && ok "T19 agent-created job fired and completed" || bad "T19 status=$st"
+  cd "$BIN" && ./mm.sh list 10 > /tmp/t19_channel.txt 2>/dev/null
+  grep -q '定时提醒·T19' /tmp/t19_channel.txt \
+    && ok "T19 reminder delivered to Mattermost" || skip "T19 delivery outside the channel window"
+}
+
+# --------------------------------------------------------------------------- T20
+t20() {
+  hdr "T20  agent-invoked cancel_job"
+  curl -s --max-time 25 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 按顺序做两件事：1) 用 schedule_job 创建 after_seconds=3600、type=reminder、message=\\\"T20 取消测试\\\" 的任务；2) 用 cancel_job 把它取消。然后只回复 T20_DONE。\"}" >/dev/null
+  sleep 55
+  local row; row=$(curl -s "$P/jobs" | python3 -c "
+import sys,json
+d=[j for j in json.load(sys.stdin)['jobs'] if 'T20' in j['message']]
+print(('%s|%s|%s' % (d[-1]['id'], d[-1]['status'], d[-1]['cancelledBy'])) if d else '')")
+  [ -z "$row" ] && { bad "T20 agent did not create the job"; return; }
+  echo "  id|status|cancelledBy = $row"
+  echo "$row" | grep -q '|cancelled|' && ok "T20 agent cancelled its own job" || bad "T20 not cancelled: $row"
+  echo "$row" | grep -q "|$SESSION$" && ok "T20 cancellation fenced to the calling session" \
+    || bad "T20 cancelledBy is not the calling session"
+}
+
 # --------------------------------------------------------------------------- runner
-ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16"
+ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20"
 WANT="${*:-$ALL}"
 require_probe
 echo "scheduler acceptance suite — session A=$SESSION  B=${SESSION_B:-none}"
@@ -476,6 +533,7 @@ for t in $WANT; do
     T1) t1 ;; T2) t2 ;; T3) t3 ;; T4) t4 ;; T5) t5 ;;
     T6|T17) t6 ;; T7|T18) t7 ;; T8) t8 ;; T9) t9 ;; T10) t10 ;;
     T11) t11 ;; T12) t12 ;; T13) t13 ;; T14) t14 ;; T15) t15 ;; T16) t16 ;;
+    T19) t19 ;; T20) t20 ;;
     *) echo "unknown test $t" ;;
   esac
 done

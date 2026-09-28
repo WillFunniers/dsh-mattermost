@@ -67,7 +67,7 @@ export function createScheduler({
   let running = false
   let stopped = false
   const inFlight = new Set()
-  const stats = { ticks: 0, dispatched: 0, failed: 0, recoveredCompleted: 0, recoveredRequeued: 0, skipped: 0 }
+  const stats = { ticks: 0, dispatched: 0, dispatchedIntoBusy: 0, failed: 0, recoveredCompleted: 0, recoveredRequeued: 0, skipped: 0 }
 
   /**
    * Dispatch one claimed job. Never throws to the caller: a failure is a
@@ -80,13 +80,21 @@ export function createScheduler({
       if (!agent || typeof agent.followup !== 'function') {
         throw new Error(`no live agent for session ${job.sessionId}`)
       }
+      // Recorded because it is the only observable evidence of the busy-session
+      // contract: a job landing on a running agent must QUEUE (followup), never
+      // redirect it (steer). Without this the assertion is unfalsifiable.
+      const wasRunning = agent.status === 'running'
       agent.followup(buildJobMessage(job))
       // Durability checkpoint: only now is the instruction provably in the
       // session inbox. Recording completion BEFORE here would lose the job on a
       // crash; never recording it would risk a duplicate on recovery.
       await store.markCompleted(job.id, now())
       stats.dispatched += 1
-      logger.info(`job dispatched id=${job.id} type=${job.type} session=${job.sessionId} attempt=${job.attempts}`)
+      if (wasRunning) stats.dispatchedIntoBusy += 1
+      logger.info(
+        `job dispatched id=${job.id} type=${job.type} session=${job.sessionId} ` +
+        `attempt=${job.attempts} agentRunning=${wasRunning} turn=followup`,
+      )
       if (typeof onDispatched === 'function') {
         try { onDispatched(job) } catch { /* observers never fail a dispatch */ }
       }
