@@ -29,6 +29,9 @@ import { createMattermostClient } from './mattermost.js'
 import { createAgentManager } from './agents.js'
 import { createOutbound } from './outbound.js'
 import { createSessionMap, deriveKey, taskKey, sessionIdFor } from './mapping.js'
+import { openJobStore } from './jobs.js'
+import { createScheduler } from './scheduler.js'
+import { registerJobTools } from './tools.js'
 
 export const name = 'dsh-mattermost'
 export const inject = ['agents', 'agentDefaultModel']
@@ -57,6 +60,21 @@ export const Config = Schema.object({
   /** Idle live-agent eviction. Sessions stay durable; only the runtime agent is released. */
   idleAgentTtlMs: Schema.number().step(1_000).min(60_000).default(30 * 60_000),
   idleSweepIntervalMs: Schema.number().step(1_000).min(10_000).default(60_000),
+
+  /**
+   * Durable delayed jobs.
+   *
+   * Deliberately NOT tied to `idleAgentTtlMs`: the whole point is that a job's
+   * lifetime is independent of the live agent's, so tuning the TTL is never the
+   * mechanism that makes delayed work reliable.
+   */
+  schedulerEnabled: Schema.boolean().default(true),
+  schedulerTickMs: Schema.number().step(500).min(1_000).default(5_000),
+  jobLeaseMs: Schema.number().step(1_000).min(10_000).default(300_000),
+  jobMaxAttempts: Schema.number().step(1).min(1).max(20).default(3),
+  maxDispatchPerTick: Schema.number().step(1).min(1).max(100).default(5),
+  jobMaxPerSession: Schema.number().step(1).min(1).max(1_000).default(50),
+  jobMaxHorizonMs: Schema.number().step(1).min(60_000).default(30 * 24 * 60 * 60 * 1_000),
 
   /** Empty = $DSH_HOME/mattermost. Never default to a test path. */
   stateDir: Schema.string().default(''),
@@ -146,15 +164,41 @@ export function apply(ctx, config) {
   const targets = new Map()
   function rememberTarget(entry) {
     if (entry && entry.channelId) {
-      targets.set(entry.sessionId, { channelId: entry.channelId, rootId: entry.rootId || undefined })
+      targets.set(entry.sessionId, {
+        channelId: entry.channelId,
+        rootId: entry.rootId || undefined,
+        // Captured so a durable job can record its delivery target and its
+        // authorization owner at creation, without depending on live state.
+        userId: entry.userId || undefined,
+      })
     }
   }
   for (const entry of sessionMap.entries()) rememberTarget(entry)
+
+  /**
+   * Where a session's output goes, and who owns it. A job records both at
+   * creation, so its delivery never depends on this process having seen the
+   * session before. Returns undefined for a session that is not bound to a
+   * Mattermost conversation — such a session cannot schedule a deliverable job.
+   */
+  function resolveJobContext(sessionId) {
+    const target = targets.get(sessionId)
+    if (!target || !target.channelId) return undefined
+    return { channelId: target.channelId, rootId: target.rootId, userId: target.userId || 'unknown' }
+  }
+
+  function requireJobStore() {
+    if (!jobStore) throw new Error('定时任务存储尚未就绪（scheduler unavailable）')
+    return jobStore
+  }
 
   let client = null
   let agentManager = null
   let outbound = null
   let started = false
+  let jobStore = null
+  let scheduler = null
+  let jobToolsDispose = null
 
   const stats = { authorized: 0, unauthorized: 0, chainRejected: 0, channelRejected: 0, evicted: 0 }
 
@@ -343,6 +387,22 @@ export function apply(ctx, config) {
     return agent
   }
 
+  // Agent-facing tools. Registered as soon as the `tools` service is up, so the
+  // agent can ask about jobs even while Mattermost is still connecting; every
+  // handler refuses loudly when the durable store is not open.
+  ctx.inject(['tools'], (toolCtx) => {
+    jobToolsDispose = registerJobTools(toolCtx, {
+      logger,
+      store: {
+        create: (input) => requireJobStore().create(input),
+        list: (options) => requireJobStore().list(options),
+        cancel: (id, options) => requireJobStore().cancel(id, options),
+      },
+      resolveContext: resolveJobContext,
+      maxHorizonMs: config.jobMaxHorizonMs,
+    })
+  })
+
   ctx.effect(() => {
     let sweepTimer = null
     ;(async () => {
@@ -385,13 +445,55 @@ export function apply(ctx, config) {
         `allowedUsers=${config.allowAll ? 'ALL' : config.allowedUsers.length}, ` +
         `botChainMax=${config.botChainMax}, idleTtlMs=${config.idleAgentTtlMs})`,
       )
+
+      // ---- durable delayed jobs ------------------------------------------
+      // Started AFTER the transport, so storage availability can never gate
+      // Mattermost itself. A job that comes due while Mattermost is down still
+      // runs; outbound.js delivers the reply once the socket returns. The
+      // scheduler resumes the target session at due time — the wake a bare
+      // `sleep` can never provide.
+      if (!config.schedulerEnabled) {
+        logger.info('scheduler disabled by config')
+      } else {
+        // Scoped injection: the plugin must NOT declare storageDomain as a hard
+        // dependency, or a storage problem would take Mattermost down with it.
+        ctx.inject(['storageDomain'], async (storageCtx) => {
+          try {
+            jobStore = await openJobStore(storageCtx, { logger, maxPerSession: config.jobMaxPerSession })
+            scheduler = createScheduler({
+              logger,
+              store: jobStore,
+              ensureAgent: ensureAgentFor,
+              tickMs: config.schedulerTickMs,
+              leaseMs: config.jobLeaseMs,
+              maxDispatchPerTick: config.maxDispatchPerTick,
+            })
+            const recovery = await scheduler.start()
+            logger.info(
+              `scheduler ready (tickMs=${config.schedulerTickMs}, leaseMs=${config.jobLeaseMs}, ` +
+              `jobs=${jobStore.stats().total}, recovered=${recovery.completed}+${recovery.requeued})`,
+            )
+          } catch (error) {
+            const store = jobStore
+            scheduler = null
+            jobStore = null
+            if (store) await store.close().catch(() => {})
+            logger.error(`scheduler disabled (durable jobs unavailable): ${error.stack || error.message}`)
+          }
+        })
+      }
     })().catch((error) => logger.error(`startup failed (dsh keeps running): ${error.stack || error.message}`))
 
     return async () => {
       if (sweepTimer) clearInterval(sweepTimer)
+      if (scheduler) await scheduler.stop().catch(() => {})
+      if (jobToolsDispose) { try { jobToolsDispose() } catch { /* ignore */ } }
       outbound?.dispose()
       client?.stop()
       if (agentManager) await agentManager.disposeAll().catch(() => {})
+      // Closing last drains queued job writes; the records stay on disk and are
+      // re-opened, unchanged, by the next process.
+      if (jobStore) await jobStore.close().catch(() => {})
     }
   }, 'dsh-mattermost.serve')
 
@@ -426,5 +528,21 @@ export function apply(ctx, config) {
     resetChain: () => { chainGuards.clear(); return true },
     /** TEST-ONLY: force one idle sweep now instead of waiting for the timer. */
     sweepNow: () => (agentManager ? agentManager.sweep() : []),
+    /**
+     * Durable delayed-job surface. Inspection and manual ticking exist so the
+     * harness can drive recovery and eviction scenarios deterministically
+     * instead of sleeping through real delays.
+     */
+    jobs: {
+      list: (options) => (jobStore ? jobStore.list(options) : []),
+      get: (id) => (jobStore ? jobStore.get(id) : undefined),
+      stats: () => (jobStore ? jobStore.stats() : null),
+      schedulerStats: () => (scheduler ? scheduler.stats : null),
+      tick: () => (scheduler ? scheduler.tick() : []),
+      recover: (now, leaseMs) => (jobStore ? jobStore.recover(now, leaseMs) : null),
+      create: (input) => requireJobStore().create(input),
+      cancel: (id, options) => requireJobStore().cancel(id, options),
+      resolveContext: (sessionId) => resolveJobContext(sessionId),
+    },
   })
 }
