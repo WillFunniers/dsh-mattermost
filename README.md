@@ -425,21 +425,87 @@ Start a fresh conversation for the current chat:
 
 ## GUI Integration
 
-Because the plugin runs inside the DSH Web process, a session started from Mattermost is the same session the DSH Web GUI shows:
+The plugin runs inside the DSH Web process, so a Mattermost conversation and the DSH Web GUI
+**can** operate on the same DSH durable session — when they address the same session id.
 
 ```
-Mattermost
-     │
-     ▼
-same DSH session
-     │
-     ▼
-DSH Web GUI
+Mattermost ──► session mm-…  ◄── DSH Web GUI (opened on that same session)
 ```
 
-You can start a task from Mattermost, open the GUI to watch it and read its history, continue the conversation from the GUI, and go back to Mattermost — all against the same live agent.
+Two things this does **not** mean:
+
+* **They are not automatically the same session.** A GUI session is whatever session you open
+  in the GUI. Opening the GUI on a *different* session gives you two independent
+  conversations; only an equal `sessionId` makes them shared. In particular, `mm-…` sessions
+  typically live under **Ungrouped** in the sidebar, not under a workspace group.
+* **Sharing applies to the live agent, which is process-local.** When a live agent exists for
+  that session, both surfaces reach the *same* agent object. Once the agent has been
+  idle-evicted (or the process restarted), the session is still there — with its full history
+  — but the shared live object is gone until something resumes it.
+
+So:
+
+| Condition | Result |
+|---|---|
+| Same session id, live agent present | Mattermost and GUI drive one shared live agent |
+| Same session id, no live agent | Same durable session; the next message from either surface resumes it |
+| Different session ids | Two unrelated conversations, even in the same process |
+
+You can start a task from Mattermost, open that same session in the GUI to watch it and read
+its history, continue from the GUI, and go back to Mattermost — all against the same durable
+session.
 
 > This requires the Mattermost plugin and DSH Web to run in the same DSH Web process.
+
+---
+
+## Delayed Jobs
+
+A delayed task must not depend on a live agent. `sleep 3600` inside an agent does: when the
+agent is idle-evicted, its scope is disposed and the background process is reclaimed with it,
+so the task silently disappears.
+
+Delayed jobs are therefore **persisted independently of the live agent lifecycle**:
+
+```
+agent calls schedule_job
+        │
+        ▼
+durable job  ──►  survives idle eviction, restart, WS loss, reboot
+        │
+        ▼
+due  ──►  the session is resumed  ──►  agent.followup()  ──►  Mattermost
+```
+
+* **Storage** — `ctx.storageDomain` (`dsh-storage-json`): atomic, fsynced, zod-validated, one
+  document per job.
+* **Lifetime** — a job outlives any number of agent evictions and process restarts. The 04:00
+  `dsh-web` restart (if configured) does not lose pending jobs.
+* **Duplicate protection** — jobs are claimed atomically with a lease; completion is persisted
+  only after the instruction is durably committed to the session inbox, and the followup
+  message carries a deterministic id so the inbox rejects a re-delivery. Delivery is
+  at-least-once with a documented, sub-millisecond duplicate window.
+* **Catch-up** — a job whose time passed while the host was down runs on startup, drained in
+  bounded batches so a long outage cannot cause a thundering herd.
+* **Cancellation** — `cancel_job`; **listing** — `list_jobs`.
+* **Scope** — jobs are fenced to the session that created them, and only Mattermost-mapped
+  sessions can schedule deliverable work.
+
+### Tools
+
+| Tool | Purpose |
+|---|---|
+| `schedule_job` | schedule a `reminder` or `agent_followup` (`after_seconds` or `at`) |
+| `list_jobs` | list this conversation's jobs |
+| `cancel_job` | cancel a pending job |
+
+### Limitations
+
+* A `completed` job means *the instruction was durably delivered to the session*, not that the
+  agent's work finished; the reply arrives through the normal conversation path.
+* Not a cron: no recurring jobs and no cron syntax.
+* Delivery is at-least-once — see the duplicate window above.
+* Jobs execute on the host; a host that is fully powered off runs nothing until it returns.
 
 ---
 
