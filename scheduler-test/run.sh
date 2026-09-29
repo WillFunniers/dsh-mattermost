@@ -521,8 +521,67 @@ print(('%s|%s|%s' % (d[-1]['id'], d[-1]['status'], d[-1]['cancelledBy'])) if d e
     || bad "T20 cancelledBy is not the calling session"
 }
 
+# --------------------------------------------------------------------------- T21
+# The scenario that actually failed in production on 2026-09-29: the user asks
+# in plain language and never names a tool. Merely registering schedule_job was
+# not enough — the agent reached for an in-session sleep loop and then proposed
+# external schedulers, because nothing in the prompt told it the tool existed.
+t21() {
+  hdr "T21  natural-language scheduling (tool never named)"
+
+  # Clear pending work first. Without this the agent may (correctly) refuse to
+  # create a duplicate reminder, which is right behaviour but makes a naive
+  # "a new job must appear" assertion fail. Observed exactly that on the first
+  # run of this test: the agent replied "你已经有一条同样的喝水提醒在等待中，
+  # 我没有重复创建".
+  local stale; stale=$(curl -s "$P/jobs" | python3 -c "
+import sys,json
+print(' '.join(j['id'] for j in json.load(sys.stdin)['jobs'] if j['status']=='pending'))")
+  for id in $stale; do
+    curl -s -X POST "$P/job/cancel" -H 'Content-Type: application/json' -d "{\"id\":\"$id\"}" >/dev/null
+  done
+  [ -n "$stale" ] && echo "  cleared $(echo "$stale" | wc -w) pre-existing pending job(s)"
+
+  local before; before=$(curl -s "$P/jobs" | python3 -c "
+import sys,json
+print(','.join(sorted(j['id'] for j in json.load(sys.stdin)['jobs'])))")
+
+  # A UNIQUE reminder text per run. A repeated identical request makes the agent
+  # either de-duplicate or (observed) call ask_user_question to confirm, which
+  # blocks the turn forever in an unattended channel.
+  local token="T21$$-$(date +%s)"
+  curl -s --max-time 25 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 10分钟后提醒我喝水，编号 $token\"}" >/dev/null
+
+  # Poll rather than sleep a fixed amount: the agent may call tools before it
+  # decides to schedule, and turn duration varies widely.
+  local row='' waited=0
+  while [ "$waited" -lt 150 ]; do
+    sleep 10; waited=$((waited+10))
+    row=$(curl -s "$P/jobs" | python3 -c "
+import sys,json,time
+before=set('$before'.split(','))
+d=[j for j in json.load(sys.stdin)['jobs'] if j['id'] not in before]
+print(('%s|%s|%d' % (d[-1]['id'], d[-1]['type'], (d[-1]['executeAt']-int(time.time()*1000))//1000)) if d else '')")
+    [ -n "$row" ] && break
+  done
+  if [ -z "$row" ]; then
+    bad "T21 agent created no new job after ${waited}s — it fell back on a sleep loop, refused, or asked a blocking question"
+    return
+  fi
+  ok "T21 plain-language request produced a NEW durable job"
+  echo "$row" | grep -q '|reminder|' && ok "T21 job is a reminder (id|type|secondsAhead = $row)" \
+    || bad "T21 job type is wrong: $row"
+  local ahead; ahead=$(echo "$row" | cut -d'|' -f3)
+  { [ "$ahead" -gt 500 ] && [ "$ahead" -lt 700 ]; } && ok "T21 scheduled ~10 minutes out ($ahead s)" \
+    || skip "T21 lead time was ${ahead}s (expected ~600s)"
+
+  local id; id=$(echo "$row" | cut -d'|' -f1)
+  [ -n "$id" ] && curl -s -X POST "$P/job/cancel" -H 'Content-Type: application/json' -d "{\"id\":\"$id\"}" >/dev/null
+}
+
 # --------------------------------------------------------------------------- runner
-ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20"
+ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21"
 WANT="${*:-$ALL}"
 require_probe
 echo "scheduler acceptance suite — session A=$SESSION  B=${SESSION_B:-none}"
@@ -533,7 +592,7 @@ for t in $WANT; do
     T1) t1 ;; T2) t2 ;; T3) t3 ;; T4) t4 ;; T5) t5 ;;
     T6|T17) t6 ;; T7|T18) t7 ;; T8) t8 ;; T9) t9 ;; T10) t10 ;;
     T11) t11 ;; T12) t12 ;; T13) t13 ;; T14) t14 ;; T15) t15 ;; T16) t16 ;;
-    T19) t19 ;; T20) t20 ;;
+    T19) t19 ;; T20) t20 ;; T21) t21 ;;
     *) echo "unknown test $t" ;;
   esac
 done
