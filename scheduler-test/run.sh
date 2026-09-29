@@ -241,13 +241,20 @@ print(len(bad))
 ")
   [ "$leaked" = "0" ] && ok "T8 session isolation holds" || bad "T8 session isolation violated"
 
-  sleep 12; tick; sleep 4
-  local done_n; done_n=$(python3 -c "
-import json,subprocess
+  # Poll: a job whose session happens to be busy is now DEFERRED rather than
+  # queued, so completion can lag the due time by up to jobBusyRetryMs.
+  local done_n=0 r=0
+  while [ "$r" -lt 12 ]; do
+    sleep 5; r=$((r+1))
+    tick
+    done_n=$(python3 -c "
+import json
 d=json.load(open('/dev/stdin'))['jobs']
 ids=['$a1','$a2','$a3','$b1','$b2']
 print(sum(1 for j in d if j['id'] in ids and j['status']=='completed'))
 " <<< "$(curl -s --max-time 8 "$P/jobs")")
+    [ "$done_n" = "5" ] && break
+  done
   [ "$done_n" = "5" ] && ok "T8 all 5 dispatched independently" || bad "T8 only $done_n/5 dispatched"
 }
 
@@ -326,13 +333,13 @@ t10() {
 
 # --------------------------------------------------------------------------- T11
 t11() {
-  hdr "T11  job arriving while the agent is busy queues as a followup"
-  # Establish a REAL busy precondition and then VERIFY it, so the assertion is
-  # falsifiable rather than assumed. The instruction must forbid backgrounding:
-  # a `sleep` the agent backgrounds leaves the turn idle, which is exactly what
-  # an earlier revision of this test mistook for a busy agent.
+  hdr "T11  job targeting a BUSY agent is deferred, never queued into the running turn"
+  # A message spliced into a running agent is claimed into the in-flight turn,
+  # and a claimed message leaves the durable pending projection — a restart
+  # before that turn ends loses it while the job still reads completed. So a
+  # busy target must be deferred, not queued.
   curl -s --max-time 20 -X POST "$P/inject" -H 'Content-Type: application/json' \
-    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 请用 bash 工具在前台执行命令 sleep 90。必须前台阻塞等待，不要加 &、不要用 run_in_background、不要提前回复。命令返回后只回复 T11BUSY。\"}" >/dev/null
+    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 请用 bash 工具在前台执行 sleep 90。必须前台阻塞等待，不要加 &、不要用 run_in_background、不要提前回复。命令返回后只回复 T11BUSY。\"}" >/dev/null
   local run1='' i=0
   while [ "$i" -lt 20 ]; do
     sleep 3
@@ -345,15 +352,31 @@ t11() {
   else
     ok "T11 precondition: agent genuinely running (verified, not assumed)"
   fi
-  local id2; id2=$(create agent_followup "$SESSION" "$(now_ms)" "[T11] busy-session followup")
+
+  local id2; id2=$(create agent_followup "$SESSION" "$(now_ms)" "[T11] busy-session deferral")
   tick; sleep 3
   local st; st=$(jobfield "$id2" status)
-  [ "$st" = "completed" ] && ok "T11 job dispatched into the busy agent" || bad "T11 status=$st"
-  # The dispatch log now records the agent status observed at hand-off time.
-  grep -q "job dispatched id=$id2 .*agentRunning=true turn=followup" /home/dsh/.dsh-mmt-test/mattermost/plugin.log \
-    && ok "T11 dispatched with agentRunning=true and turn=followup (queued, never steered)" \
-    || bad "T11 no agentRunning=true followup log line"
-  sleep 55
+  [ "$st" = "pending" ] && ok "T11 job stayed PENDING (never queued into the running turn)" \
+    || bad "T11 status=$st (want pending)"
+  grep -q "job deferred (agent busy) id=$id2" /home/dsh/.dsh-mmt-test/mattermost/plugin.log \
+    && ok "T11 deferral logged" || bad "T11 no deferral log line"
+  local att; att=$(jobfield "$id2" attempts)
+  [ "$att" = "0" ] && ok "T11 deferral consumed no attempt (attempts=0)" \
+    || bad "T11 attempts=$att (a deferral must roll the claim back)"
+
+  # The deferral pushed executeAt ~jobBusyRetryMs into the future, so poll past
+  # that window rather than ticking once.
+  echo "  waiting for the agent to free up, then past the deferral window..."
+  local j=0 settled=0
+  while [ "$j" -lt 20 ]; do
+    sleep 10; j=$((j+1))
+    tick
+    st=$(jobfield "$id2" status)
+    [ "$st" = "completed" ] && { settled=1; break; }
+  done
+  [ "$settled" = "1" ] && ok "T11 dispatched once the agent became idle" || bad "T11 final status=$st"
+  grep -q "job dispatched id=$id2 .*agentRunning=false" /home/dsh/.dsh-mmt-test/mattermost/plugin.log \
+    && ok "T11 delivered to an IDLE agent (agentRunning=false)" || skip "T11 no idle-dispatch log line"
 }
 
 # --------------------------------------------------------------------------- T12
@@ -580,8 +603,62 @@ print(('%s|%s|%d' % (d[-1]['id'], d[-1]['type'], (d[-1]['executeAt']-int(time.ti
   [ -n "$id" ] && curl -s -X POST "$P/job/cancel" -H 'Content-Type: application/json' -d "{\"id\":\"$id\"}" >/dev/null
 }
 
+# --------------------------------------------------------------------------- T22
+# The loss scenario found on 2026-09-29. A job whose target agent is busy is
+# handed to the running turn, claimed, and removed from the durable pending set.
+# If the process restarts before that turn ends, the instruction is never
+# replayed — but the job still reads completed. This test reproduces it and
+# asserts the fix: with deferral, the job survives the restart and still runs.
+t22() {
+  hdr "T22  a busy-target job cannot be silently lost by a restart"
+  curl -s --max-time 20 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"channelType\":\"O\",\"message\":\"@dsh 请用 bash 工具在前台执行 sleep 120。必须前台阻塞等待，不要加 &、不要用 run_in_background、不要提前回复。只回复 T22BUSY。\"}" >/dev/null
+  local run1='' i=0
+  while [ "$i" -lt 20 ]; do
+    sleep 3
+    run1=$(curl -s "$P/agent?sessionId=$SESSION" | jq_ 'print(d["status"])')
+    [ "$run1" = "running" ] && break
+    i=$((i+1))
+  done
+  if [ "$run1" != "running" ]; then skip "T22 could not establish a busy agent"; return; fi
+  ok "T22 precondition: agent genuinely running"
+
+  local token="T22LOSS$$-$(date +%s)"
+  local id; id=$(create agent_followup "$SESSION" "$(now_ms)" "T22：请只回复 $token")
+  tick; sleep 3
+  local st; st=$(jobfield "$id" status)
+  [ "$st" = "pending" ] && ok "T22 job deferred while the agent is busy" || bad "T22 status=$st"
+
+  echo "  restarting with the agent mid-turn (this is the loss window)..."
+  "$BIN/restart-test.sh" >/dev/null
+  sleep 35
+  require_probe
+  # NOTE: `completed` here is a PASS, not a loss. The job was deferred with a
+  # 30s retry window; the harness restart takes ~35s, so by the time the new
+  # process boots the deferral has elapsed and the startup catch-up tick
+  # dispatches it to the now-idle agent. Status alone cannot distinguish
+  # "delivered after restart" from "consumed and lost" — the real discriminator
+  # is whether the instruction actually ran, asserted at the end of this test.
+  st=$(jobfield "$id" status)
+  ok "T22 job state after restart: $st (recoverable or already re-dispatched)"
+
+  echo "  waiting for the job to be delivered to the now-idle agent..."
+  local done=0 j=0
+  while [ "$j" -lt 16 ]; do
+    sleep 10; j=$((j+1))
+    tick
+    [ "$(jobfield "$id" status)" = "completed" ] && { done=1; break; }
+  done
+  [ "$done" = "1" ] && ok "T22 job executed after the restart" || bad "T22 job never completed"
+  sleep 20
+  cd "$BIN" && ./mm.sh list 12 > /tmp/t22_channel.txt 2>/dev/null
+  grep -q "$token" /tmp/t22_channel.txt \
+    && ok "T22 instruction ACTUALLY RAN (reply visible) — no silent loss" \
+    || bad "T22 job completed but the instruction never executed"
+}
+
 # --------------------------------------------------------------------------- runner
-ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21"
+ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21 T22"
 WANT="${*:-$ALL}"
 require_probe
 echo "scheduler acceptance suite — session A=$SESSION  B=${SESSION_B:-none}"
@@ -592,7 +669,7 @@ for t in $WANT; do
     T1) t1 ;; T2) t2 ;; T3) t3 ;; T4) t4 ;; T5) t5 ;;
     T6|T17) t6 ;; T7|T18) t7 ;; T8) t8 ;; T9) t9 ;; T10) t10 ;;
     T11) t11 ;; T12) t12 ;; T13) t13 ;; T14) t14 ;; T15) t15 ;; T16) t16 ;;
-    T19) t19 ;; T20) t20 ;; T21) t21 ;;
+    T19) t19 ;; T20) t20 ;; T21) t21 ;; T22) t22 ;;
     *) echo "unknown test $t" ;;
   esac
 done

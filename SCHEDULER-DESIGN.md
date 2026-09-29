@@ -101,14 +101,30 @@ duplicate id:
 
 Two consequences used by this design:
 
-* **Delivery is durable.** Once `followup()` resolves, the instruction is committed to the
-  session log and will be processed when the session next runs — even if the process dies
-  immediately afterwards.
+* **Delivery is durable for an IDLE agent.** When the target is idle, the spliced message is
+  claimed and processed immediately, so the work happens and cannot be orphaned.
 * **A caller-pinned message id gives inbox-level duplicate rejection.** Note
   `createMessage()` overwrites `id` with a fresh `randomUUID()`, and the inbox projection
   validates inserted messages with `z.custom()` (no shape check). A message may therefore
   be constructed with a deterministic id:
   `{ ...createUserMessage({...}), id: 'mmjob-<jobId>' }`.
+
+> **CORRECTION (2026-09-29, found while answering a production review question).** An earlier
+> revision of this design claimed that *"once `followup()` resolves, the instruction is
+> committed to the session log and will be processed when the session next runs — even if the
+> process dies immediately afterwards."* **That is wrong for a BUSY agent.**
+>
+> Verified by experiment: a message spliced into a running agent is **claimed into the
+> in-flight turn immediately** (the durable log shows `agent/inbox/spliced` with
+> `removed=1`), and a claimed message is **removed from the durable pending projection**. If
+> the process restarts before that turn ends, the instruction is never replayed — it remains
+> in the log as history but does not run — while the job still reads `completed`. That is a
+> silent loss: precisely the class of failure this feature exists to eliminate.
+>
+> **Consequence:** the scheduler must **never hand work to a running agent**. A busy target is
+> *deferred* — the job returns to `pending` and is retried on a later tick — so an instruction
+> is only ever delivered to an idle agent, where it is claimed and executed in the same
+> breath. See §13 and the `defer()` transition in §16.
 
 ### 2.2 Why core `schedule` is not used
 

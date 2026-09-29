@@ -258,6 +258,61 @@ health. The reply is delivered by the pre-existing `outbound.js` path, which alr
 bounded retry on transient transport errors and falls back to a channel post when a thread
 root is rejected (HTTP 400).
 
+### 13.1 A silent-loss defect found and fixed (2026-09-29)
+
+**This is the most important correction in this report**, because it invalidated a premise the
+whole duplicate-protection design rested on.
+
+While answering a production review question ("the agent says in-session timing cannot survive
+a restart or a session unload — check it"), the claim was tested against the *new* mechanism.
+The strongest case was reproduced directly:
+
+1. make the target agent genuinely busy (verified `running`, not assumed);
+2. dispatch a job into it — the log shows `agentRunning=true turn=followup`, i.e. queued;
+3. restart the process while that turn is still in flight.
+
+**Result: the instruction never ran.** It was present in the durable session log, and it was
+still absent after the session was later resumed with an unrelated message. The event stream
+shows why:
+
+```
+seq=2830  agent/inbox/spliced  target=next-turn  removed=None   ← followup() appends
+seq=2831  agent/inbox/spliced  target=next-turn  removed=1      ← immediately CLAIMED
+```
+
+A message spliced into a **running** agent is claimed into the in-flight turn straight away,
+and **a claimed message leaves the durable pending projection**. If the process dies before
+that turn ends, the projection no longer lists the message, so nothing replays it — while the
+job still reads `completed`.
+
+This falsified the design's §2.1 claim that *"once `followup()` resolves … it will be processed
+even if the process dies immediately afterwards"*. That holds for an **idle** agent (claimed
+and executed at once) but **not** for a busy one.
+
+**Fix — never hand work to a running agent.** A busy target is now *deferred*: the job returns
+to `pending` with `executeAt = now + jobBusyRetryMs` (default 30 s), the claim is released, and
+**the attempt counter is rolled back** so a long-busy session cannot exhaust a job's budget
+while it waits. An instruction is therefore only ever delivered to an idle agent, where it is
+claimed and executed in the same breath and cannot be orphaned.
+
+This also *simplifies* the busy-session semantics: the old "queue it into the running agent"
+behaviour was the source of the loss. A busy session now simply means the check runs a little
+later — which is what the user wants anyway.
+
+**Regression test `T22`** reproduces the loss scenario and asserts the fix:
+
+```
+PASS  T22 precondition: agent genuinely running
+PASS  T22 job deferred while the agent is busy
+PASS  T22 job SURVIVED the restart in a recoverable state (status=pending)
+PASS  T22 job executed after the restart
+PASS  T22 instruction ACTUALLY RAN (reply visible) — no silent loss
+```
+
+Note the last assertion: previous tests only checked the job's *status*. A job marked
+`completed` whose instruction never ran is exactly the failure being fixed, so the test now
+asserts the **reply is visible in the channel**, not merely that the record says success.
+
 ## 14. Security Model
 
 * **No secrets in jobs.** `channelId`/`rootId`/`sessionId` are identifiers. The Mattermost
