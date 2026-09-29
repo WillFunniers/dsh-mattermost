@@ -199,6 +199,7 @@ export function apply(ctx, config) {
   let jobStore = null
   let scheduler = null
   let jobToolsDispose = null
+  let jobPromptDispose = null
 
   const stats = { authorized: 0, unauthorized: 0, chainRejected: 0, channelRejected: 0, evicted: 0 }
 
@@ -403,6 +404,29 @@ export function apply(ctx, config) {
     })
   })
 
+  // Advertise the capability in the system prompt.
+  //
+  // Registering a tool is NOT sufficient. Measured in production on 2026-09-29:
+  // `schedule_job` was present in the agent's tool list from 04:00 yet the agent
+  // still reached for an in-session `sleep` loop (and proposed an external scheduler/systemd
+  // workarounds) because nothing told it the tool existed and its own history
+  // was full of "in-session timers do not survive". A tool the model never
+  // considers is indistinguishable from a missing tool.
+  ctx.inject(['systemPrompt'], (promptCtx) => {
+    jobPromptDispose = promptCtx.systemPrompt.section({
+      name: 'tool:delayed-jobs',
+      // No TOOL_SCHEDULE slot exists; sit immediately after the background-jobs
+      // section, which is the neighbouring concept.
+      order: promptCtx.systemPrompt.getSectionOrder('TOOL_JOBS') + 1,
+      text: 'For anything that must happen later — a reminder, or checking on work after a delay — '
+        + 'use schedule_job, and manage those with list_jobs / cancel_job. Do NOT implement a delay '
+        + 'with `sleep` in bash or an in-session polling loop: those are reclaimed when this agent is '
+        + 'idle-evicted or the host restarts, so the work silently disappears. A scheduled job is '
+        + 'persisted independently of this agent and still runs after this session goes idle or the '
+        + 'process restarts, so you do not need to stay awake waiting for it.',
+    })
+  })
+
   ctx.effect(() => {
     let sweepTimer = null
     ;(async () => {
@@ -488,6 +512,7 @@ export function apply(ctx, config) {
       if (sweepTimer) clearInterval(sweepTimer)
       if (scheduler) await scheduler.stop().catch(() => {})
       if (jobToolsDispose) { try { jobToolsDispose() } catch { /* ignore */ } }
+      if (jobPromptDispose) { try { jobPromptDispose() } catch { /* ignore */ } }
       outbound?.dispose()
       client?.stop()
       if (agentManager) await agentManager.disposeAll().catch(() => {})
