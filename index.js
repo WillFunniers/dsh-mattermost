@@ -73,6 +73,12 @@ export const Config = Schema.object({
   jobLeaseMs: Schema.number().step(1_000).min(10_000).default(300_000),
   jobMaxAttempts: Schema.number().step(1).min(1).max(20).default(3),
   maxDispatchPerTick: Schema.number().step(1).min(1).max(100).default(5),
+  /**
+   * How long to wait before retrying a job whose target session is busy.
+   * A running agent is never handed new work (see scheduler.js): a message
+   * queued into an in-flight turn can be lost by a restart.
+   */
+  jobBusyRetryMs: Schema.number().step(1_000).min(1_000).default(30_000),
   jobMaxPerSession: Schema.number().step(1).min(1).max(1_000).default(50),
   jobMaxHorizonMs: Schema.number().step(1).min(60_000).default(30 * 24 * 60 * 60 * 1_000),
 
@@ -491,6 +497,7 @@ export function apply(ctx, config) {
               tickMs: config.schedulerTickMs,
               leaseMs: config.jobLeaseMs,
               maxDispatchPerTick: config.maxDispatchPerTick,
+              busyRetryMs: config.jobBusyRetryMs,
             })
             const recovery = await scheduler.start()
             logger.info(

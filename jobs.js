@@ -246,6 +246,36 @@ export async function openJobStore(ctx, { logger, maxPerSession = 50 } = {}) {
     ))
   }
 
+  /**
+   * Hand a claimed job back because the target agent is busy.
+   *
+   * This is NOT a failure and must not consume an attempt: nothing was
+   * delivered. The attempt counter is rolled back so a session that stays busy
+   * for a long time cannot exhaust a job's budget while it waits.
+   *
+   * Why defer at all, rather than queueing into the running agent: a message
+   * spliced into a BUSY agent is immediately claimed into the in-flight turn,
+   * and a claimed message is removed from the durable pending projection. A
+   * restart before that turn finishes therefore loses the instruction silently
+   * while the job still reads `completed`. Handing work only to an IDLE agent
+   * removes that window entirely.
+   */
+  async function defer(id, until, now = Date.now()) {
+    return table.update(id, (current) => (
+      current.status === 'running'
+        ? {
+          ...current,
+          status: 'pending',
+          executeAt: until,
+          attempts: Math.max(0, current.attempts - 1),
+          claimId: null,
+          claimedAt: null,
+          updatedAt: now,
+        }
+        : current
+    ))
+  }
+
   /** Retryable failure: back to pending with backoff, or terminal at the cap. */
   async function retryOrFail(id, error, backoffMs, now = Date.now()) {
     return table.update(id, (current) => {
@@ -343,7 +373,7 @@ export async function openJobStore(ctx, { logger, maxPerSession = 50 } = {}) {
 
   return {
     create, get, list, due, claim, markCompleted,
-    retryOrFail, fail, cancel, recover, stats,
+    retryOrFail, fail, defer, cancel, recover, stats,
     close: () => domain.close(),
     _table: table,
   }
