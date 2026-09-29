@@ -300,6 +300,7 @@ Production was never touched.
 | T16 | offline backlog drained in bounded batches | PASS |
 | T19 | **agent-invoked `schedule_job`** (real agent, not the probe) | PASS |
 | T20 | **agent-invoked `cancel_job`**, session-fenced | PASS |
+| T21 | **natural-language request, tool never named** | PASS |
 
 **Totals:** final regression `run_final.log` = **52 pass / 0 fail / 1 skip** (T1–T20, the skip
 being one cosmetic T15 sub-assertion noted below), plus 7/7 on the eviction replay
@@ -391,6 +392,47 @@ in-memory scan, so an idle scheduler with no due jobs is close to free.
 * `idleAgentTtlMs` was **not** changed; the fix does not depend on it.
 * The test harness's plugin symlink was repointed to the clone for testing (its original
   target is recorded in §20) — this affects only the isolated harness.
+
+### 18.1 First production contact (2026-09-29)
+
+The feature's first real use failed — and the failure is instructive.
+
+At **03:07 UTC** a user asked: *"接下来的5个小时内，你可以每隔半小时来询问我一个项目进度的问题。
+我们来测试一下定时任务是否正常"*. The agent implemented it as an **in-session loop**
+(`progress-ping.py`, background job `bash-314`). At **04:00:03** the daily restart killed it.
+**1 of 10** pings was delivered.
+
+**This was not a scheduler failure: the feature was not in production yet.** The new code
+loaded at **04:00:09** — 53 minutes *after* the request. At 03:07 the running plugin was the
+old one, which has no `schedule_job` tool at all, so the agent used the only mechanism it had.
+The failure it demonstrated is exactly the one this work removes.
+
+Three things came out of that contact.
+
+1. **The scheduler is live and healthy in production.**
+   `2026-09-29T04:00:09.751Z scheduler ready (tickMs=5000, leaseMs=300000, jobs=0, recovered=0+0)`,
+   zero ERROR lines, process stable (39 FDs, 11 threads). No job has been created yet, so the
+   `mattermost_jobs` domain is still absent — which is why an observer sees "no scheduled tasks".
+
+2. **A tool the model never considers is indistinguishable from a missing tool.** From 04:00
+   onward `schedule_job` / `list_jobs` / `cancel_job` *were* in the agent's tool list — verified
+   directly in the production session log (`request/header`) — yet the agent still reached for a
+   `sleep` loop and proposed Dokploy / systemd workarounds. Nothing in the prompt advertised the
+   capability, and the session's own history was full of "in-session timers do not survive".
+   **Fix:** a `systemPrompt.section` entry — the same mechanism `dsh-tool-jobs` uses — placed
+   immediately after the `TOOL_JOBS` section, stating that delayed work must use `schedule_job`
+   and that `sleep` loops are reclaimed on eviction or restart.
+   **Verified after the fix:** the plain-language request 「10分钟后提醒我喝水」, which never
+   names a tool, produced a durable reminder ~10 minutes out, and the agent explained the
+   independence property back to the user unprompted.
+   Regression test `T21` covers exactly this, with a unique token per run so the request is never
+   an ambiguous duplicate.
+
+3. **Observed, not fixed (pre-existing, unrelated to the scheduler).** When asked for a reminder
+   that duplicates one already pending, the agent may call `ask_user_question`. In an unattended
+   Mattermost channel nothing answers, so the turn blocks indefinitely (`status=running`, no
+   reply, no job). This is ordinary DSH tool behaviour, but it is worth knowing for unattended
+   Mattermost use, and it is why T21 uses a unique reminder text.
 
 ## 19. Known Limitations
 
