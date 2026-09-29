@@ -61,13 +61,14 @@ export function createScheduler({
   tickMs = 5_000,
   leaseMs = 300_000,
   maxDispatchPerTick = 5,
+  busyRetryMs = 30_000,
   now = () => Date.now(),
 } = {}) {
   let timer = null
   let running = false
   let stopped = false
   const inFlight = new Set()
-  const stats = { ticks: 0, dispatched: 0, dispatchedIntoBusy: 0, failed: 0, recoveredCompleted: 0, recoveredRequeued: 0, skipped: 0 }
+  const stats = { ticks: 0, dispatched: 0, deferred: 0, failed: 0, recoveredCompleted: 0, recoveredRequeued: 0, skipped: 0 }
 
   /**
    * Dispatch one claimed job. Never throws to the caller: a failure is a
@@ -80,20 +81,41 @@ export function createScheduler({
       if (!agent || typeof agent.followup !== 'function') {
         throw new Error(`no live agent for session ${job.sessionId}`)
       }
-      // Recorded because it is the only observable evidence of the busy-session
-      // contract: a job landing on a running agent must QUEUE (followup), never
-      // redirect it (steer). Without this the assertion is unfalsifiable.
-      const wasRunning = agent.status === 'running'
+
+      // NEVER hand work to a running agent.
+      //
+      // A message spliced into a busy agent is claimed into the in-flight turn
+      // straight away, and a claimed message leaves the durable pending
+      // projection. Measured: a job dispatched into a busy agent, then a process
+      // restart before that turn ended, left the instruction in the session log
+      // but it was never replayed — and the job still read `completed`. That is
+      // a silent loss, the exact failure this whole feature exists to remove.
+      //
+      // So a busy target is deferred, not queued: the job stays pending and is
+      // retried on a later tick, and is only ever delivered to an IDLE agent,
+      // where the message is processed immediately and cannot be orphaned.
+      // Nothing has been delivered at this point, so this is not a failure and
+      // consumes no attempt.
+      if (agent.status === 'running') {
+        const retryAt = now() + busyRetryMs
+        await store.defer(job.id, retryAt)
+        stats.deferred += 1
+        logger.info(
+          `job deferred (agent busy) id=${job.id} session=${job.sessionId} ` +
+          `retryInMs=${busyRetryMs} attemptsKept=${job.attempts - 1}`,
+        )
+        return false
+      }
+
       agent.followup(buildJobMessage(job))
-      // Durability checkpoint: only now is the instruction provably in the
-      // session inbox. Recording completion BEFORE here would lose the job on a
-      // crash; never recording it would risk a duplicate on recovery.
+      // Durability checkpoint: only now is the instruction provably committed.
+      // Recording completion BEFORE here would lose the job on a crash; never
+      // recording it would risk a duplicate on recovery.
       await store.markCompleted(job.id, now())
       stats.dispatched += 1
-      if (wasRunning) stats.dispatchedIntoBusy += 1
       logger.info(
         `job dispatched id=${job.id} type=${job.type} session=${job.sessionId} ` +
-        `attempt=${job.attempts} agentRunning=${wasRunning} turn=followup`,
+        `attempt=${job.attempts} agentRunning=false turn=followup`,
       )
       if (typeof onDispatched === 'function') {
         try { onDispatched(job) } catch { /* observers never fail a dispatch */ }
