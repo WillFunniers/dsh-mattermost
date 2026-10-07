@@ -414,7 +414,7 @@ export function apply(ctx, config) {
   //
   // Registering a tool is NOT sufficient. Measured in production on 2026-09-29:
   // `schedule_job` was present in the agent's tool list from 04:00 yet the agent
-  // still reached for an in-session `sleep` loop (and proposed an external scheduler/systemd
+  // still reached for an in-session `sleep` loop (and proposed external-scheduler
   // workarounds) because nothing told it the tool existed and its own history
   // was full of "in-session timers do not survive". A tool the model never
   // considers is indistinguishable from a missing tool.

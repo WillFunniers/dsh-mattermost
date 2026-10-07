@@ -9,7 +9,8 @@
 # profile nor the production process is touched: only this isolated harness
 # (DSH_HOME=$MMT_HOME) is restarted, with an env override.
 set -u
-BIN=$WORKDIR/dsh-mattermost
+MMT_HOME="${MMT_HOME:-$HOME/.dsh-mmt-test}"
+BIN="${MMT_BIN:?set MMT_BIN to the harness checkout that holds restart-test.sh}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TTL_MS="${TTL_MS:-60000}"
 SWEEP_MS="${SWEEP_MS:-10000}"

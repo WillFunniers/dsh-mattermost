@@ -573,7 +573,7 @@ mapping, `channels`) are **not modified**.
 
 ## 21. Test plan
 
-Isolated harness only (`DSH_HOME=$MMT_HOME`, profile `mmt-test`, port 3090,
+Isolated harness only (a throwaway `DSH_HOME`, profile `mmt-test`, port 3090,
 probe 3091). Production is never touched.
 
 | # | Test | Method |

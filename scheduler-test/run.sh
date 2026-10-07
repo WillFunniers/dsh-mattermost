@@ -10,10 +10,13 @@
 # Evidence is written to scheduler-test/evidence/.
 set -u
 
-BIN=$WORKDIR/dsh-mattermost
+# Harness locations. Neither is baked in: point them at your own setup.
+MMT_HOME="${MMT_HOME:-$HOME/.dsh-mmt-test}"
+BIN="${MMT_BIN:?set MMT_BIN to the harness checkout that holds restart-test.sh and mm.sh}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 P=http://127.0.0.1:3091
-CH=<your-channel-id>
-OWNER=<your-user-id>
+CH="${MM_TEST_CHANNEL:?set MM_TEST_CHANNEL to your Mattermost channel id}"
+OWNER="${MM_TEST_OWNER:?set MM_TEST_OWNER to your authorized Mattermost user id}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 E="$HERE/evidence"
 mkdir -p "$E"
@@ -302,7 +305,7 @@ PY
 
   # The deterministic inbox id is what makes the requeue safe.
   node -e "
-import('$WORKDIR/dsh-mattermost-sched/scheduler.js').then(m=>{
+import('$REPO/scheduler.js').then(m=>{
   const a=m.buildJobMessage({id:'job-x',type:'reminder',executeAt:Date.now(),message:'m'})
   const b=m.buildJobMessage({id:'job-x',type:'reminder',executeAt:Date.now(),message:'m'})
   console.log(a.id===b.id && a.id==='mmjob-job-x' ? 'DETERMINISTIC' : 'RANDOM')

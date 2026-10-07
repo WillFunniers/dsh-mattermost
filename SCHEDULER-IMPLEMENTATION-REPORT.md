@@ -332,7 +332,7 @@ asserts the **reply is visible in the channel**, not merely that the record says
 
 ## 15. Test Matrix
 
-Harness: `DSH_HOME=$MMT_HOME`, profile `mmt-test`, probe `127.0.0.1:3091`.
+Harness: a throwaway `DSH_HOME`, profile `mmt-test`, probe `127.0.0.1:3091`.
 Production was never touched.
 
 | # | Test | Result |
@@ -472,7 +472,7 @@ Three things came out of that contact.
 2. **A tool the model never considers is indistinguishable from a missing tool.** From 04:00
    onward `schedule_job` / `list_jobs` / `cancel_job` *were* in the agent's tool list — verified
    directly in the production session log (`request/header`) — yet the agent still reached for a
-   `sleep` loop and proposed an external scheduler / systemd workarounds. Nothing in the prompt advertised the
+   `sleep` loop and proposed external-scheduler workarounds. Nothing in the prompt advertised the
    capability, and the session's own history was full of "in-session timers do not survive".
    **Fix:** a `systemPrompt.section` entry — the same mechanism `dsh-tool-jobs` uses — placed
    immediately after the `TOOL_JOBS` section, stating that delayed work must use `schedule_job`

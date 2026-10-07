@@ -7,9 +7,11 @@
 # synthetic session ids because the plugin's own `jobMaxPerSession` guard (50 by
 # default) would otherwise — correctly — refuse the larger batches.
 set -u
+MMT_HOME="${MMT_HOME:-$HOME/.dsh-mmt-test}"
+BIN="${MMT_BIN:?set MMT_BIN to the harness checkout that holds restart-test.sh}"
 P=http://127.0.0.1:3091
-CH=<your-channel-id>
-OWNER=<your-user-id>
+CH="${MM_TEST_CHANNEL:?set MM_TEST_CHANNEL to your Mattermost channel id}"
+OWNER="${MM_TEST_OWNER:?set MM_TEST_OWNER to your authorized Mattermost user id}"
 PER_SESSION=45
 HERE="$(cd "$(dirname "$0")" && pwd)"
 E="$HERE/evidence"; mkdir -p "$E"
@@ -69,7 +71,7 @@ done | tee "$E/perf_table.txt"
 
 echo
 echo "=== startup: store open + recovery cost (from plugin.log timestamps) ==="
-$WORKDIR/dsh-mattermost/restart-test.sh >/dev/null
+$BIN/restart-test.sh >/dev/null
 sleep 40
 python3 - "$LOG" <<'PY' | tee "$E/perf_startup.txt"
 import re, sys, datetime

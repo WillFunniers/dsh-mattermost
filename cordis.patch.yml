@@ -9,7 +9,7 @@
       config:
         baseUrl: !!js process.env.MATTERMOST_URL || ''
         tokenRef: MATTERMOST_TOKEN
-        cwd: !!js process.env.MATTERMOST_CWD || '$WORKDIR'
+        cwd: !!js process.env.MATTERMOST_CWD || process.cwd()
 
         # Empty = every channel the bot is in. Production should list them.
         channels: !!js (process.env.MATTERMOST_CHANNELS || '').split(',').filter(Boolean)
