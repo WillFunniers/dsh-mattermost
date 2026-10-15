@@ -660,8 +660,190 @@ t22() {
     || bad "T22 job completed but the instruction never executed"
 }
 
+# --------------------------------------------------------------------------- T23
+t23() {
+  hdr "T23  unexpired job survives restart and still fires"
+  local at; at=$(($(now_ms)+90000))
+  local id; id=$(create reminder "$SESSION" "$at" "[T23] unexpired across restart")
+  [ "$(jobfield "$id" status)" = "pending" ] && ok "T23 job pending before restart" || bad "T23 not pending"
+
+  "$BIN/restart-test.sh" >/dev/null; sleep 35; require_probe
+  local st; st=$(jobfield "$id" status)
+  [ "$st" = "pending" ] && ok "T23 still pending after restart (not fired early)" || bad "T23 status=$st"
+  [ "$st" != "unknown" ] && ok "T23 unexpired job was NOT marked unknown" || bad "T23 wrongly marked unknown"
+
+  echo "  waiting for it to become due..."
+  sleep 60; tick; sleep 3
+  st=$(jobfield "$id" status)
+  [ "$st" = "completed" ] && ok "T23 delivered when its time arrived" || bad "T23 final status=$st"
+}
+
+# --------------------------------------------------------------------------- T24
+t24() {
+  hdr "T24  due-but-undelivered job is recovered (safe requeue)"
+  local at; at=$(($(now_ms)+3600000))
+  local id; id=$(create reminder "$SESSION" "$at" "[T24] crashed before delivery")
+  python3 - "$id" "$MMT_HOME" <<'PYNEST'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[2]) / "storages/mattermost_jobs/jobs" / (sys.argv[1] + ".json")
+d = json.loads(p.read_text()); r = d["record"]
+r.update(status="running", claimId="deadbeefdeadbeef", claimedAt=1, attempts=1,
+         dispatchedAt=None, deliveryAttemptedAt=None, completedAt=None)
+p.write_text(json.dumps(d))
+PYNEST
+  "$BIN/restart-test.sh" >/dev/null; sleep 35; require_probe
+  local st; st=$(jobfield "$id" status)
+  [ "$st" = "pending" ] && ok "T24 requeued (no delivery was attempted)" || bad "T24 status=$st (want pending)"
+  curl -s --max-time 8 "$P/faults" | grep -q 'job-orphaned' \
+    && ok "T24 informational fault recorded for the requeue" || bad "T24 no job-orphaned fault"
+}
+
+# --------------------------------------------------------------------------- T25
+t25() {
+  hdr "T25  delivered-but-unknown is NOT replayed (marked unknown)"
+  local at; at=$(($(now_ms)+3600000))
+  local id; id=$(create agent_followup "$SESSION" "$at" "[T25] must never be replayed")
+  python3 - "$id" "$MMT_HOME" <<'PYNEST'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[2]) / "storages/mattermost_jobs/jobs" / (sys.argv[1] + ".json")
+d = json.loads(p.read_text()); r = d["record"]
+r.update(status="running", claimId="deadbeefdeadbeef", claimedAt=1, attempts=1,
+         dispatchedAt=None, completedAt=None, deliveryAttemptedAt=1)
+p.write_text(json.dumps(d))
+PYNEST
+  local before; before=$(grep -c "job dispatched id=$id" "$MMT_HOME/mattermost/plugin.log" 2>/dev/null); before=${before:-0}
+
+  "$BIN/restart-test.sh" >/dev/null; sleep 35; require_probe
+
+  local st; st=$(jobfield "$id" status)
+  [ "$st" = "unknown" ] && ok "T25 marked UNKNOWN (not completed, not failed)" || bad "T25 status=$st (want unknown)"
+  [ "$st" != "pending" ] && ok "T25 NOT returned to pending" || bad "T25 was requeued - blind replay risk"
+
+  sleep 20; tick; sleep 3
+  local after; after=$(grep -c "job dispatched id=$id" "$MMT_HOME/mattermost/plugin.log" 2>/dev/null); after=${after:-0}
+  [ "$before" = "$after" ] && ok "T25 instruction was NOT re-delivered ($before -> $after)" \
+    || bad "T25 RE-DELIVERED ($before -> $after)"
+  [ "$(jobfield "$id" status)" = "unknown" ] && ok "T25 still unknown after ticks" || bad "T25 state drifted"
+
+  local n; n=$(curl -s --max-time 8 "$P/faults" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)['faults']
+print(sum(1 for f in d if f['type']=='job-unknown' and f['jobId']=='$id'))")
+  [ "$n" = "1" ] && ok "T25 exactly one job-unknown fault raised" || bad "T25 fault count=$n"
+  local human; human=$(curl -s --max-time 8 "$P/faults" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)['faults']
+f=[x for x in d if x['type']=='job-unknown' and x['jobId']=='$id']
+print(f[0]['needsHuman'] if f else 'none')")
+  [ "$human" = "True" ] && ok "T25 fault is flagged needsHuman" || bad "T25 needsHuman=$human"
+}
+
+# --------------------------------------------------------------------------- T26
+t26() {
+  hdr "T26  repeated recovery creates no duplicate fault events"
+  local id; id=$(curl -s --max-time 8 "$P/faults" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)['faults']
+f=[x for x in d if x['type']=='job-unknown']
+print(f[0]['jobId'] if f else '')")
+  if [ -z "$id" ]; then skip "T26 no job-unknown fault to re-test"; return; fi
+  local before; before=$(curl -s --max-time 8 "$P/faults" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["faults"]))')
+
+  "$BIN/restart-test.sh" >/dev/null; sleep 35; require_probe
+  local mid; mid=$(curl -s --max-time 8 "$P/faults" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["faults"]))')
+  "$BIN/restart-test.sh" >/dev/null; sleep 35; require_probe
+  local after; after=$(curl -s --max-time 8 "$P/faults" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["faults"]))')
+
+  [ "$before" = "$mid" ] && [ "$mid" = "$after" ] \
+    && ok "T26 fault count stable across 2 recovery boots ($before -> $mid -> $after)" \
+    || bad "T26 fault count grew ($before -> $mid -> $after)"
+  [ "$(jobfield "$id" status)" = "unknown" ] && ok "T26 job still unknown, no extra dispatch" || bad "T26 job state changed"
+}
+
+# --------------------------------------------------------------------------- T27
+t27() {
+  hdr "T27  notification is not silently dropped while Mattermost is down"
+  curl -s --max-time 8 -X POST "$P/wssuspend" >/dev/null; sleep 2
+  local at; at=$(($(now_ms)+3600000))
+  local id; id=$(create reminder "$SESSION" "$at" "[T27] notify while offline")
+  local ev; ev=$(curl -s --max-time 8 -X POST "$P/fault/raise" -H 'Content-Type: application/json' \
+    -d "{\"type\":\"job-orphaned\",\"outcome\":\"informational\",\"jobId\":\"$id\",\"sessionId\":\"$SESSION\",\"channelId\":\"$CH\",\"lastKnownState\":\"test\",\"needsHuman\":false,\"detail\":\"T27\"}" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["id"])' 2>/dev/null)
+  [ -n "$ev" ] && ok "T27 fault raised ($ev)" || { bad "T27 fault raise failed"; return; }
+
+  curl -s --max-time 8 -X POST "$P/fault/flush" >/dev/null
+  local st; st=$(curl -s --max-time 8 "$P/faults" | python3 -c "
+import sys,json
+f=[x for x in json.load(sys.stdin)['faults'] if x['id']=='$ev']
+print(f[0]['notifyState'] if f else 'missing')")
+  [ "$st" = "pending" ] && ok "T27 notification still PENDING (owed, not lost)" || bad "T27 notifyState=$st (want pending)"
+  [ "$st" != "sent" ] && ok "T27 not falsely marked as delivered" || bad "T27 claimed delivery while offline"
+  curl -s --max-time 12 -X POST "$P/wsresume" >/dev/null; sleep 8
+}
+
+# --------------------------------------------------------------------------- T28
+t28() {
+  hdr "T28  pending notification is retried after reconnect"
+  local conn; conn=$(curl -s --max-time 6 "$P/status" | python3 -c 'import sys,json;print(json.load(sys.stdin)["connected"])')
+  [ "$conn" = "True" ] || { curl -s --max-time 12 -X POST "$P/wsresume" >/dev/null; sleep 8; }
+  curl -s --max-time 15 -X POST "$P/fault/flush" >/dev/null
+  local st; st=$(curl -s --max-time 8 "$P/faults" | python3 -c "
+import sys,json
+f=[x for x in json.load(sys.stdin)['faults'] if x['type']=='job-orphaned' and x.get('detail')=='T27']
+print(f[0]['notifyState'] if f else 'missing')")
+  [ "$st" = "sent" ] && ok "T28 notification sent after reconnect" || bad "T28 notifyState=$st (want sent)"
+  sleep 3
+  cd "$BIN" && ./mm.sh list 8 > /tmp/t28.txt 2>/dev/null
+  grep -q '定时任务已安全回收' /tmp/t28.txt \
+    && ok "T28 notification actually visible in the channel" || skip "T28 not in the last 8 posts"
+}
+
+# --------------------------------------------------------------------------- T29
+t29() {
+  hdr "T29  corrupt job does not lose the other jobs"
+  local at; at=$(($(now_ms)+3600000))
+  local good; good=$(create reminder "$SESSION" "$at" "[T29] healthy neighbour")
+  printf '{"version":1,"record":{"id":"not-a-job"}}' \
+    > "$MMT_HOME/storages/mattermost_jobs/jobs/job-00000000000000aa.json"
+  printf '{ this is not json' \
+    > "$MMT_HOME/storages/mattermost_jobs/jobs/job-00000000000000bb.json"
+
+  "$BIN/restart-test.sh" >/dev/null; sleep 35; require_probe
+  local stats; stats=$(curl -s --max-time 8 "$P/jobs" | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin)["stats"]))')
+  [ -n "$stats" ] && ok "T29 job unit still opened ($stats)" || bad "T29 job unit failed to open"
+  [ "$(jobfield "$good" status)" = "pending" ] && ok "T29 healthy neighbour still present" || bad "T29 neighbour lost"
+  local n; n=$(curl -s --max-time 8 "$P/faults" | python3 -c "
+import sys,json
+print(sum(1 for f in json.load(sys.stdin)['faults'] if f['type']=='job-corrupt'))")
+  [ "$n" -ge 1 ] && ok "T29 corruption surfaced as $n fault event(s)" || bad "T29 corruption was silent"
+  local backed; backed=$(ls "$MMT_HOME"/storages/mattermost_jobs/jobs/*.bak.* 2>/dev/null | wc -l)
+  [ "$backed" -ge 1 ] && ok "T29 corrupt documents preserved ($backed backup file(s))" || skip "T29 no .bak artefact"
+  curl -s -X POST "$P/job/cancel" -H 'Content-Type: application/json' -d "{\"id\":\"$good\"}" >/dev/null
+}
+
+# --------------------------------------------------------------------------- T32
+t32() {
+  hdr "T32  no duplicate scheduler/timer after re-init"
+  local t1 t2
+  t1=$(curl -s --max-time 8 "$P/jobs" | python3 -c 'import sys,json;print(json.load(sys.stdin)["scheduler"]["ticks"])')
+  sleep 20
+  t2=$(curl -s --max-time 8 "$P/jobs" | python3 -c 'import sys,json;print(json.load(sys.stdin)["scheduler"]["ticks"])')
+  local delta=$((t2 - t1))
+  echo "  ticks: $t1 -> $t2 (delta $delta over 20s)"
+  if [ "$delta" -ge 2 ] && [ "$delta" -le 6 ]; then
+    ok "T32 exactly one scheduler loop is running (delta=$delta, expected ~4)"
+  else
+    bad "T32 tick rate suggests duplicate schedulers (delta=$delta)"
+  fi
+  local ready boots
+  ready=$(grep -c 'scheduler ready' "$MMT_HOME/mattermost/plugin.log")
+  boots=$(grep -c 'apply() entered' "$MMT_HOME/mattermost/plugin.log")
+  [ "$ready" -le "$boots" ] && ok "T32 one 'scheduler ready' per boot ($ready <= $boots)" \
+    || bad "T32 $ready scheduler-ready lines for $boots boots"
+}
+
 # --------------------------------------------------------------------------- runner
-ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21 T22"
+ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21 T22 T23 T24 T25 T26 T27 T28 T29 T32"
 WANT="${*:-$ALL}"
 require_probe
 echo "scheduler acceptance suite — session A=$SESSION  B=${SESSION_B:-none}"
@@ -673,6 +855,7 @@ for t in $WANT; do
     T6|T17) t6 ;; T7|T18) t7 ;; T8) t8 ;; T9) t9 ;; T10) t10 ;;
     T11) t11 ;; T12) t12 ;; T13) t13 ;; T14) t14 ;; T15) t15 ;; T16) t16 ;;
     T19) t19 ;; T20) t20 ;; T21) t21 ;; T22) t22 ;;
+    T23) t23 ;; T24) t24 ;; T25) t25 ;; T26) t26 ;; T27) t27 ;; T28) t28 ;; T29) t29 ;; T32) t32 ;;
     *) echo "unknown test $t" ;;
   esac
 done
