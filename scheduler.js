@@ -107,10 +107,19 @@ export function createScheduler({
         return false
       }
 
+      // ORDER MATTERS, and this is the crux of safe recovery:
+      //   1. persist the delivery INTENT  (durable, before the side effect)
+      //   2. hand the instruction to the inbox  (the side effect)
+      //   3. persist success
+      //
+      // If the process dies before (1), nothing was delivered and recovery may
+      // safely requeue. If it dies between (2) and (3), the outcome is genuinely
+      // unknown — recovery marks the job `unknown` and asks a human instead of
+      // replaying a task that may already have run. Writing only (3), as an
+      // earlier revision did, made those two cases indistinguishable and could
+      // re-deliver an instruction that was already executing.
+      await store.markDeliveryAttempted(job.id, now())
       agent.followup(buildJobMessage(job))
-      // Durability checkpoint: only now is the instruction provably committed.
-      // Recording completion BEFORE here would lose the job on a crash; never
-      // recording it would risk a duplicate on recovery.
       await store.markCompleted(job.id, now())
       stats.dispatched += 1
       logger.info(

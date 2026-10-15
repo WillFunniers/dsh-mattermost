@@ -48,9 +48,9 @@ export const JOB_SCHEMA_VERSION = 1
 export const JOB_TYPES = /** @type {const} */ (['reminder', 'agent_followup'])
 
 export const JOB_STATUS = /** @type {const} */ ([
-  'pending', 'running', 'completed', 'failed', 'cancelled',
+  'pending', 'running', 'completed', 'failed', 'cancelled', 'unknown',
 ])
-const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'unknown'])
 
 /** A job id is also a per-record path segment, so the alphabet is constrained. */
 const JOB_ID_RE = /^job-[0-9a-f]{16}$/
@@ -87,6 +87,15 @@ export const jobSchema = z.object({
   claimedAt: z.number().int().nullable(),
   /** Set once the instruction is durably in the session inbox. */
   dispatchedAt: z.number().int().nullable(),
+  /**
+   * Written BEFORE the delivery side effect (`agent.followup`). Its whole
+   * purpose is to make recovery decidable: a job that is `running` with no
+   * marker provably never reached the inbox and is safe to requeue, while one
+   * WITH a marker may have been delivered and must never be replayed blindly.
+   */
+  deliveryAttemptedAt: z.number().int().nullable(),
+  /** Why a job ended in `unknown` (for the human-facing notification). */
+  unknownReason: z.string().max(500).nullable(),
   lastError: z.string().max(1000).nullable(),
   completedAt: z.number().int().nullable(),
   cancelledBy: z.string().max(200).nullable(),
@@ -158,6 +167,8 @@ export async function openJobStore(ctx, { logger, maxPerSession = 50 } = {}) {
       claimId: null,
       claimedAt: null,
       dispatchedAt: null,
+      deliveryAttemptedAt: null,
+      unknownReason: null,
       lastError: null,
       completedAt: null,
       cancelledBy: null,
@@ -240,6 +251,53 @@ export async function openJobStore(ctx, { logger, maxPerSession = 50 } = {}) {
           ...current,
           status: 'completed',
           dispatchedAt: current.dispatchedAt ?? now,
+          completedAt: now,
+          updatedAt: now,
+        }
+    ))
+  }
+
+  /**
+   * Record the DELIVERY INTENT, durably, immediately BEFORE the side effect.
+   *
+   * This is the single field that makes crash recovery decidable instead of
+   * guessed. `dispatchedAt` is written after `followup()` succeeds, so on its
+   * own it cannot tell "never sent" from "sent, result unknown" — and the old
+   * recovery path treated both as requeue, i.e. it could re-deliver an
+   * instruction that was already running.
+   *
+   * Ordering is the whole point:
+   *   markDeliveryAttempted()  ← durable, and it happens FIRST
+   *   agent.followup()         ← the side effect
+   *   markCompleted()          ← durable success
+   *
+   * A crash before the marker  -> nothing was sent -> safe to requeue.
+   * A crash after the marker   -> outcome genuinely unknown -> never replay.
+   */
+  async function markDeliveryAttempted(id, now = Date.now()) {
+    return table.update(id, (current) => (
+      current.status === 'running' && current.deliveryAttemptedAt == null
+        ? { ...current, deliveryAttemptedAt: now, updatedAt: now }
+        : current
+    ))
+  }
+
+  /**
+   * Terminal, but NOT a success and NOT a confirmed failure.
+   *
+   * The delivery was attempted and its outcome cannot be established from
+   * inside the plugin. The job must not be replayed (that could double-execute a
+   * side effect) and must not be reported as failed (nothing proved it failed).
+   * It is parked for a human, and a fault event is raised alongside it.
+   */
+  async function markUnknown(id, reason, now = Date.now()) {
+    return table.update(id, (current) => (
+      isTerminal(current.status)
+        ? current
+        : {
+          ...current,
+          status: 'unknown',
+          unknownReason: String(reason ?? 'delivery outcome could not be confirmed').slice(0, 500),
           completedAt: now,
           updatedAt: now,
         }
@@ -331,31 +389,62 @@ export async function openJobStore(ctx, { logger, maxPerSession = 50 } = {}) {
   }
 
   /**
-   * Startup recovery.
+   * Startup recovery — decided by EVIDENCE, never by assumption.
    *
-   *   running + dispatchedAt  -> the instruction is already committed to the
-   *                              durable session inbox, so it WILL run. Mark
-   *                              completed; re-dispatching would duplicate it.
-   *   running + no dispatchedAt, claim stale
-   *                           -> delivery state unknown. Return to pending; the
-   *                              deterministic message id makes the re-dispatch
-   *                              idempotent while the original is still pending.
+   * Three cases, each with a different proof obligation:
+   *
+   *   running + completedAt/dispatchedAt
+   *       The instruction is durably in the session inbox, so it will run.
+   *       Mark completed. Re-dispatching would duplicate it.
+   *
+   *   running + deliveryAttemptedAt, no completion
+   *       The side effect was attempted and its outcome is NOT knowable from
+   *       here. The agent may have executed it, partly executed it, or never
+   *       started. Mark `unknown`, raise a fault, and require a human. This is
+   *       the case the previous revision got wrong by requeueing.
+   *
+   *   running + no deliveryAttemptedAt, claim stale
+   *       `followup()` was provably never called, so nothing was delivered and
+   *       no side effect exists. Safe to return to pending.
+   *
+   * Returns counts for all three so the caller can raise faults only for the
+   * ones that need a human.
    */
   async function recover(now = Date.now(), leaseMs = 300_000) {
-    const recovered = { completed: 0, requeued: 0 }
+    const recovered = { completed: 0, requeued: 0, unknown: 0, completedIds: [], requeuedIds: [], unknownIds: [] }
     for (const [id, record] of [...table.entries()]) {
       if (record.status !== 'running') continue
       const staleSince = record.claimedAt == null || now - record.claimedAt >= leaseMs
-      if (record.dispatchedAt != null) {
+
+      if (record.dispatchedAt != null || record.completedAt != null) {
         await markCompleted(id, now)
         recovered.completed += 1
-      } else if (staleSince) {
+        recovered.completedIds.push(id)
+        continue
+      }
+
+      if (record.deliveryAttemptedAt != null) {
+        // Ambiguous. Never replay.
+        await markUnknown(id, 'process stopped after delivery was attempted; execution result unknown', now)
+        recovered.unknown += 1
+        recovered.unknownIds.push(id)
+        continue
+      }
+
+      if (staleSince) {
         await table.update(id, (current) => (
           current.status === 'running'
-            ? { ...current, status: 'pending', claimId: null, claimedAt: null, updatedAt: now }
+            ? {
+              ...current,
+              status: 'pending',
+              claimId: null,
+              claimedAt: null,
+              updatedAt: now,
+            }
             : current
         ))
         recovered.requeued += 1
+        recovered.requeuedIds.push(id)
       }
     }
     return recovered
@@ -374,6 +463,7 @@ export async function openJobStore(ctx, { logger, maxPerSession = 50 } = {}) {
   return {
     create, get, list, due, claim, markCompleted,
     retryOrFail, fail, defer, cancel, recover, stats,
+    markDeliveryAttempted, markUnknown,
     close: () => domain.close(),
     _table: table,
   }
