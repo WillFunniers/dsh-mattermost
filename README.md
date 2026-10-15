@@ -509,6 +509,57 @@ due  ──►  the session is resumed  ──►  agent.followup()  ──►  
 
 ---
 
+## Fault Observability
+
+The plugin does not pretend to know things it cannot. When a fault is detected it is
+recorded **durably**, and when a human is needed the plugin says so in Mattermost.
+
+### What is detected, and what it means
+
+| Detection | Meaning | Automatic action |
+|---|---|---|
+| Job due, never delivered | nothing was sent | **requeued** — safe |
+| Job not yet due across a restart | nothing was attempted | stays scheduled |
+| Process stopped **after** delivery was attempted | **execution result unknown** | marked `unknown`, **never replayed**, notified |
+| A turn was still running when the process stopped | work was cut off | notified, correlated to any job delivered into that turn |
+| A job document was corrupt / schema-incompatible | that record was isolated | other jobs unaffected; notified |
+| A notification could not be sent | it is still owed | retried until Mattermost accepts it |
+
+The distinction that matters: a job is only marked `unknown` when there is **evidence a
+delivery was attempted**. If the plugin can prove nothing was sent, it requeues; if it
+cannot prove anything, it asks instead of guessing.
+
+### Delivery semantics, stated honestly
+
+`completed` means **the instruction was durably handed to the session inbox** — not that the
+agent finished the work. There is a residual window where a process dies between "delivered"
+and "completion recorded"; that window is **detected** and reported as `unknown`, but its
+execution outcome is genuinely unknowable from inside the plugin. **Exactly-once is not
+claimed.**
+
+### Fault events
+
+Faults live in their own domain (`mattermost_faults`), separate from jobs so a fault record
+can never make a job unreadable. Each event carries:
+
+* a **stable, deterministic id** — re-running recovery cannot produce duplicates;
+* what the plugin can actually claim (`unknown` / `interrupted` / `isolated` / `informational`);
+* the last **confirmed** state, the related session and job;
+* whether a human is required;
+* notification state (`pending` / `sent` / `failed`), and whether Mattermost accepted it.
+
+Notifications are sent with the event id, so the same event is never announced twice, and
+`sent` is recorded only on a successful response.
+
+### What this does not do
+
+* **It cannot report a fully dead process.** The plugin runs inside `dsh web`; if that process
+  dies, the plugin cannot send anything. Detecting that needs systemd/journal-level
+  monitoring, which is out of scope here.
+* **It never auto-replays a task whose result is unknown.** That decision is left to you.
+* **It does not fake a result.** `unknown` is a first-class outcome.
+
+
 ## MCP Integration
 
 This plugin covers the **inbound** path: Mattermost messages reaching a DSH agent, and the agent's replies going back.

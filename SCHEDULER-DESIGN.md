@@ -291,12 +291,14 @@ Notes.
                  ┌─────────┐   cancel_job    ┌───────────┐
                  │ pending │ ──────────────► │ cancelled │ (terminal)
                  └────┬────┘                 └───────────┘
-                      │ due + claim
+                      │ due + atomic claim
                       ▼
                  ┌─────────┐
                  │ running │  claimId leased, claimedAt set
                  └────┬────┘
-       followup ok    │   │  dispatch threw
+      markDeliveryAttempted()   ← durable, BEFORE the side effect
+                      │
+        followup ok   │   │  dispatch threw
         ┌─────────────┘   └──────────────┐
         ▼                                ▼
   ┌───────────┐               attempts < maxAttempts
@@ -306,6 +308,13 @@ Notes.
    durable inbox              │ pending │   │ failed │ (terminal)
                               │ (retry) │   └────────┘
                               └─────────┘
+
+  process died with the marker written but no completion
+                      │
+                      ▼
+                 ┌─────────┐
+                 │ unknown │ (terminal) → fault event, human required, NEVER replayed
+                 └─────────┘
 ```
 
 Transitions are applied with `table.update(key, fn)`, which is an **atomic
@@ -313,16 +322,41 @@ read-modify-write on the domain's write chain** — concurrent transitions canno
 
 `completed` means *"the instruction is durably in the session inbox"*, not *"the agent has
 finished the work"*. The agent's answer arrives through the pre-existing `outbound.js`
-path, exactly like any other message. This is deliberate: the DSH turn that the job
-triggers may run for an hour, and the scheduler must not block on it (§12).
+path, exactly like any other message. The DSH turn the job triggers may run for an hour, and
+the scheduler must not block on it (§12).
 
 > **Why there is no `dispatched` state.** An earlier revision of this design had
-> `running → dispatched → completed`. Implementation showed that nothing ever performs the
-> second transition: handing the message to `agent.followup()` *is* the success condition,
-> because the inbox commit is durable. An intermediate state that nothing settles makes
-> "is this job done?" unanswerable and would have left every successful job parked
-> forever. `completed` is therefore the single terminal success state, and `dispatchedAt`
-> is retained as a field for observability.
+> `running → dispatched → completed`. Nothing ever performs the second transition: handing
+> the message to `agent.followup()` *is* the success condition, because the inbox commit is
+> durable. An intermediate state that nothing settles makes "is this job done?" unanswerable
+> and would leave every successful job parked forever. `completed` is therefore the single
+> terminal success state; `dispatchedAt` is retained as a field for observability.
+>
+> **A second correction (fault-observability work, 2026-10-15).** `completed` describing
+> *delivery* is accurate but insufficient: there is a window where the instruction was
+> delivered and its **execution outcome is unknowable**. The first revision resolved that
+> window by returning the job to `pending`, i.e. it re-delivered a task that might already
+> have run. That is now fixed by persisting the delivery **intent** before the side effect
+> and adding an `unknown` terminal state — see §10.1.
+
+### 8.1 The two fields that make recovery decidable
+
+```
+deliveryAttemptedAt   written durably BEFORE agent.followup()
+dispatchedAt          written durably AFTER followup() returns
+completedAt           written durably with dispatchedAt
+```
+
+Recovery reads them in that order and can therefore *prove* which case it is, instead of
+guessing:
+
+| Persisted evidence | Conclusion | Action |
+|---|---|---|
+| `completedAt` / `dispatchedAt` set | delivered | → `completed` |
+| `deliveryAttemptedAt` set, no completion | **unknowable** | → `unknown`, raise fault, **never replay** |
+| neither set, claim stale | provably never delivered | → `pending` (safe requeue) |
+
+Only the middle row is genuinely undecidable, and it is the only one that refuses to act.
 
 ## 9. Persistence strategy
 
@@ -382,30 +416,54 @@ Mechanism, in order:
    : j)` — the transform runs on the write chain, so two ticks cannot both claim.
 2. **Lease.** A claim is valid for `leaseMs` (default 5 min). On startup, a `running` job
    whose `claimedAt` is older than the lease is *orphaned* and returns to the recovery path.
-3. **Durable delivery marker.** Right after `followup()` resolves, persist
-   `status:'completed'`, `dispatchedAt`. Because the inbox is durable (§2.1), a job that
-   reached `completed` **must not be re-dispatched**: the instruction is already committed
-   to the session log and will run.
-4. **Deterministic message id.** The followup message carries
-   `id = 'mmjob-' + jobId` instead of a random UUID. If a crash occurred between
-   `followup()` and the completion write, recovery re-dispatches with the **same** id;
-   while the original is still pending the inbox projection rejects it as
-   `message "…" is already pending`, which recovery treats as **success** (already
-   delivered). This closes the common duplicate path.
-5. **Bounded attempts.** `maxAttempts` (default 3) stops a poison job from looping.
+3. **Delivery INTENT, persisted before the side effect.** `markDeliveryAttempted()` writes
+   `deliveryAttemptedAt` durably *before* `agent.followup()` is called. This is what makes
+   recovery decidable rather than guessed (see 8.1).
+4. **Durable delivery marker.** Right after `followup()` resolves, persist
+   `status:'completed'`, `dispatchedAt`/`completedAt`. Because the inbox is durable (2.1), a
+   job that reached `completed` **must not be re-dispatched**: the instruction is already
+   committed to the session log and will run.
+5. **Deterministic message id.** The followup message carries `id = 'mmjob-' + jobId`
+   instead of a random UUID, so a re-dispatch of an instruction still pending in the inbox
+   is rejected by the projection as `message "..." is already pending`.
+6. **Bounded attempts.** `maxAttempts` (default 3) stops a poison job from looping.
 
-**Guarantee, stated precisely.** Delivery is **at-least-once**, with a duplicate window
-confined to a crash landing between `followup()` resolving and the `dispatched` record
-becoming durable *and* the original inbox message having already been consumed. That window
-is sub-millisecond and requires a crash at that exact instant. Steps 3–4 make the
-overwhelming majority of crash points exactly-once. The design prefers at-least-once
-because for a user-requested check, **a duplicate is a minor annoyance while a silent
-loss is a failure**. This residual window is documented as a known limitation (§19 of the
-implementation report), not hidden.
+### 10.1 What this does and does not guarantee
 
-Compensating control for `agent_followup`: the delivered text is prefixed with a stable
-marker carrying the job id, so a rare duplicate is self-identifying to the user and to the
-agent.
+After the 8.1 marker, the previously-ambiguous window no longer resolves by replay:
+
+| Crash point | Evidence left behind | Recovery action |
+|---|---|---|
+| before the claim | `pending` | normal scheduling |
+| after claim, before the intent marker | `running`, no marker | **safe requeue** - nothing was sent |
+| after the marker, before `followup()` returns | `running` + marker | **`unknown` + fault** - delivery may or may not have happened |
+| after `followup()` returns, before the completion write | `running` + marker | **`unknown` + fault** - the instruction may be executing |
+| after the completion write | `completed` | no action |
+
+The residual uncertainty is no longer *silently resolved by re-running a task*. It is
+**detected, recorded durably, and escalated to a human**. That is a deliberate trade: the
+earlier revision preferred at-least-once and would re-deliver; the current revision prefers
+**never double-executing a side effect**, and asks instead.
+
+**Exactly-once is still not claimed, and should not be.** What is unknown is genuinely
+unknown: the plugin cannot see whether the upstream turn started. What changed is that the
+plugin no longer *pretends* to know.
+
+Compensating control for `agent_followup`: the delivered text carries a stable marker with
+the job id, so a duplicate (a manual re-run, or the safe-requeue case above) is
+self-identifying.
+
+### 10.2 Fault events and notifications
+
+Recovery facts become durable **fault events** (a separate `mattermost_faults` domain, see 9)
+with a **stable, deterministic id** derived from the subject, so running recovery on every
+boot cannot multiply events for one condition. Each event carries what the plugin can
+actually claim (`unknown` / `interrupted` / `isolated` / `informational`), the last
+**confirmed** state, and whether a human is required.
+
+Notifications are queued on the event and retried from the existing sweep interval until
+Mattermost accepts them; `sent` is recorded only on a successful response, never
+optimistically. A notification that cannot be delivered is therefore owed, not lost.
 
 ## 11. Expired jobs (downtime catch-up)
 
