@@ -20,7 +20,7 @@
  *   own/system/deleted -> channel whitelist -> user authorization
  *   -> trigger -> bot-chain budget -> command layer -> dispatch
  */
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
@@ -32,6 +32,7 @@ import { createSessionMap, deriveKey, taskKey, sessionIdFor } from './mapping.js
 import { openJobStore } from './jobs.js'
 import { createScheduler } from './scheduler.js'
 import { registerJobTools } from './tools.js'
+import { openFaultStore, renderFault, faultId } from './faults.js'
 
 export const name = 'dsh-mattermost'
 export const inject = ['agents', 'agentDefaultModel']
@@ -206,6 +207,7 @@ export function apply(ctx, config) {
   let scheduler = null
   let jobToolsDispose = null
   let jobPromptDispose = null
+  let faultStore = null
 
   const stats = { authorized: 0, unauthorized: 0, chainRejected: 0, channelRejected: 0, evicted: 0 }
 
@@ -388,6 +390,171 @@ export function apply(ctx, config) {
     )
   }
 
+  /**
+   * Deliver every fault notification that is still owed.
+   *
+   * Called at startup and from the existing idle-sweep interval, so a Mattermost
+   * outage simply delays notifications instead of dropping them: the pending
+   * state is durable and each event has a stable id, so a retry cannot produce a
+   * duplicate. A send is only recorded as `sent` when Mattermost actually
+   * accepted it — never optimistically.
+   */
+  async function flushFaultNotifications() {
+    if (!faultStore || !client || !client.state.connected) return 0
+    const due = faultStore.pendingNotifications(10)
+    let sent = 0
+    for (const event of due) {
+      try {
+        await client.send(event.channelId, renderFault(event), event.rootId || undefined)
+        await faultStore.markNotified(event.id)
+        sent += 1
+        logger.info(`fault notified id=${event.id} type=${event.type}`)
+      } catch (error) {
+        await faultStore.markNotifyFailed(event.id, error).catch(() => {})
+        logger.warn(`fault notify failed id=${event.id}: ${error.message}`)
+      }
+    }
+    return sent
+  }
+
+  /**
+   * Turn recovery facts into durable, deduplicated fault events.
+   *
+   * Every event carries a STABLE id derived from its subject, so running
+   * recovery on every boot cannot multiply events for one underlying condition.
+   *
+   * Note what is deliberately NOT done here: a job whose delivery outcome is
+   * unknown is recorded and reported, never replayed. And a job whose *turn* was
+   * interrupted is left as `completed`, because `completed` means "delivered" —
+   * an accurate statement. What is unknown is the EXECUTION, and that is what the
+   * fault says. Rewriting the job's status would conflate the two.
+   */
+  async function reportRecoveryFaults(recovery) {
+    if (!faultStore || !jobStore) return { raised: 0 }
+
+    let raised = 0
+
+    // (a) delivery attempted, outcome unknowable
+    for (const id of recovery.unknownIds || []) {
+      const job = jobStore.get(id)
+      if (!job) continue
+      const target = resolveJobContext(job.sessionId)
+      await faultStore.raise({
+        id: faultId('job-unknown', id),
+        type: 'job-unknown',
+        outcome: 'unknown',
+        jobId: id,
+        sessionId: job.sessionId,
+        lastKnownState: 'running (delivery attempted, completion not recorded)',
+        needsHuman: true,
+        detail: '进程在投递前后停止,无法确认该任务是否已执行。按设计不会自动重放。',
+        channelId: target?.channelId,
+        rootId: target?.rootId,
+      })
+      raised += 1
+    }
+
+    // (b) a claimed job that provably never reached the inbox -> safely requeued
+    for (const id of recovery.requeuedIds || []) {
+      const job = jobStore.get(id)
+      if (!job) continue
+      const target = resolveJobContext(job.sessionId)
+      await faultStore.raise({
+        id: faultId('job-orphaned', id),
+        type: 'job-orphaned',
+        outcome: 'informational',
+        jobId: id,
+        sessionId: job.sessionId,
+        lastKnownState: 'running -> pending (no delivery was attempted)',
+        needsHuman: false,
+        detail: '该任务在投递前进程停止,已安全回到待执行,无需处理。',
+        channelId: target?.channelId,
+        rootId: target?.rootId,
+      })
+      raised += 1
+    }
+
+    // (c) turns that were still open when the process stopped
+    for (const sess of faultStore.interruptedSessions()) {
+      const target = resolveJobContext(sess.sessionId)
+      // Correlate with a job delivered into that very turn. Jobs are only ever
+      // dispatched to an IDLE agent, so a delivered job is what OPENED this turn
+      // — which makes the correlation tight rather than speculative.
+      let related = []
+      try {
+        related = jobStore.list({ sessionId: sess.sessionId, includeTerminal: true })
+          .filter((j) => j.status === 'completed' && j.completedAt != null
+            && j.completedAt >= (sess.openedAt ?? 0) - 5_000)
+      } catch { /* correlation is best-effort */ }
+      const jobIds = related.map((j) => j.id)
+
+      await faultStore.raise({
+        id: faultId('turn-interrupted', sess.sessionId, String(sess.turn ?? sess.openedAt ?? '')),
+        type: 'turn-interrupted',
+        outcome: 'interrupted',
+        sessionId: sess.sessionId,
+        jobId: jobIds[0] ?? null,
+        lastKnownState: `turn ${sess.turn ?? '?'} still open when the process stopped`,
+        needsHuman: jobIds.length > 0,
+        detail: jobIds.length
+          ? `该会话的一轮执行被中断,涉及定时任务 ${jobIds.join(', ')};其结果未知。`
+          : '该会话的一轮执行被中断;没有关联的定时任务,结果未知但无需处理。',
+        channelId: target?.channelId,
+        rootId: target?.rootId,
+      })
+      raised += 1
+
+      // The turn is no longer open; clear it so it is not reported again.
+      await faultStore.clearTurn(sess.sessionId).catch(() => {})
+    }
+
+    return { raised }
+  }
+
+  /**
+   * Best-effort detection of job documents the storage layer isolated.
+   *
+   * The storage layer quarantines a corrupt or schema-incompatible record by
+   * moving it to `<name>.json.bak.<stamp>` and opening without it. That protects
+   * the other jobs (verified), but it does so SILENTLY as far as the plugin is
+   * concerned. Comparing the documents on disk with the records actually loaded
+   * is what turns that into something the user is told about.
+   *
+   * Deliberately best-effort and non-fatal: it reads a storage-layout convention
+   * (per-record documents under $DSH_HOME/storages/<domain>/<table>/), so any
+   * failure here is logged and ignored rather than affecting the plugin.
+   */
+  async function detectCorruptJobs() {
+    if (!faultStore || !jobStore) return 0
+    try {
+      const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+      const dir = join(home, 'storages', 'mattermost_jobs', 'jobs')
+      if (!existsSync(dir)) return 0
+      const loaded = new Set(jobStore.list({ includeTerminal: true }).map((j) => j.id))
+      let found = 0
+      for (const file of readdirSync(dir)) {
+        if (!file.startsWith('job-') || !file.endsWith('.json')) continue
+        const id = file.slice(0, -'.json'.length)
+        if (loaded.has(id)) continue
+        await faultStore.raise({
+          id: faultId('job-corrupt', id),
+          type: 'job-corrupt',
+          outcome: 'isolated',
+          jobId: id,
+          lastKnownState: 'document present on disk but not loaded',
+          needsHuman: false,
+          detail: '该任务记录无法解析或与当前 schema 不兼容,已被存储层隔离(原文件保留为 .bak),其他任务不受影响。',
+        })
+        found += 1
+      }
+      if (found) logger.warn(`fault store: ${found} isolated job document(s) recorded`)
+      return found
+    } catch (error) {
+      logger.warn(`corruption probe skipped: ${error.message}`)
+      return 0
+    }
+  }
+
   async function ensureAgentFor(sessionId) {
     const agent = await agentManager.ensureAgent(sessionId)
     agentManager.touchActivity(sessionId)
@@ -460,12 +627,29 @@ export function apply(ctx, config) {
         resolveTarget: (sessionId) => targets.get(sessionId),
         maxChars: config.maxReplyChars,
       })
-      ctx.on('session/event', (session, event) => outbound.onSessionEvent(session, event))
+      ctx.on('session/event', (session, event) => {
+        outbound.onSessionEvent(session, event)
+        // Turn bookkeeping for interrupted-work detection. Deliberately added
+        // here rather than inside outbound.js: that module is verified and its
+        // delivery semantics must not change. The event subscription already
+        // existed, so this adds no new listener lifecycle.
+        if (!faultStore) return
+        if (event && event.type === 'turn/start') {
+          faultStore.turnOpened(String(session.id), event.data?.turn)
+            .catch((error) => logger.warn(`fault turn-open failed: ${error.message}`))
+        } else if (event && event.type === 'turn/end') {
+          faultStore.turnClosed(String(session.id))
+            .catch((error) => logger.warn(`fault turn-close failed: ${error.message}`))
+        }
+      })
 
       // S1: release idle live agents. Sessions stay durable; the next message for
       // an evicted session goes observeSession -> resume, which is the tested path.
       sweepTimer = setInterval(() => {
         agentManager.sweep().catch((error) => logger.warn(`idle sweep failed: ${error.message}`))
+        // Retry any notification Mattermost has not accepted yet. Reuses this
+        // timer so a fault feature cannot leak an extra interval.
+        flushFaultNotifications().catch((error) => logger.warn(`fault flush failed: ${error.message}`))
       }, config.idleSweepIntervalMs)
 
       started = true
@@ -490,6 +674,15 @@ export function apply(ctx, config) {
         ctx.inject(['storageDomain'], async (storageCtx) => {
           try {
             jobStore = await openJobStore(storageCtx, { logger, maxPerSession: config.jobMaxPerSession })
+            // A SEPARATE domain from the jobs: a fault record can never make a
+            // job unreadable, and a job can never hide a fault. If it fails to
+            // open we lose visibility but keep scheduling — logged, never silent.
+            try {
+              faultStore = await openFaultStore(storageCtx, { logger })
+            } catch (faultError) {
+              faultStore = null
+              logger.error(`fault store unavailable (fault visibility reduced): ${faultError.message}`)
+            }
             scheduler = createScheduler({
               logger,
               store: jobStore,
@@ -502,8 +695,27 @@ export function apply(ctx, config) {
             const recovery = await scheduler.start()
             logger.info(
               `scheduler ready (tickMs=${config.schedulerTickMs}, leaseMs=${config.jobLeaseMs}, ` +
-              `jobs=${jobStore.stats().total}, recovered=${recovery.completed}+${recovery.requeued})`,
+              `jobs=${jobStore.stats().total}, ` +
+              `recovered=${recovery.completed}+${recovery.requeued}+${recovery.unknown})`,
             )
+            // Turn recovery facts into durable, deduplicated fault events, then
+            // record any job document the storage layer had to isolate.
+            try {
+              const rep = await reportRecoveryFaults(recovery)
+              const isolated = await detectCorruptJobs()
+              if (faultStore) {
+                logger.info(
+                  `fault store ready (events=${faultStore.stats().total}, ` +
+                  `pendingNotifications=${faultStore.stats().pendingNotifications}, ` +
+                  `raisedThisBoot=${rep.raised}, isolated=${isolated})`,
+                )
+              }
+            } catch (reportError) {
+              logger.warn(`fault reporting failed (jobs unaffected): ${reportError.message}`)
+            }
+            // Anything owed from a previous process goes out as soon as the
+            // socket is up; failures stay pending and are retried by the sweep.
+            await flushFaultNotifications().catch(() => {})
           } catch (error) {
             const store = jobStore
             scheduler = null
@@ -526,6 +738,7 @@ export function apply(ctx, config) {
       // Closing last drains queued job writes; the records stay on disk and are
       // re-opened, unchanged, by the next process.
       if (jobStore) await jobStore.close().catch(() => {})
+      if (faultStore) await faultStore.close().catch(() => {})
     }
   }, 'dsh-mattermost.serve')
 
@@ -575,6 +788,21 @@ export function apply(ctx, config) {
       create: (input) => requireJobStore().create(input),
       cancel: (id, options) => requireJobStore().cancel(id, options),
       resolveContext: (sessionId) => resolveJobContext(sessionId),
+    },
+    /** Durable fault surface (probe/test): inspection and manual notification flush. */
+    faults: {
+      list: (options) => (faultStore ? faultStore.list(options) : []),
+      get: (id) => (faultStore ? faultStore.get(id) : undefined),
+      stats: () => (faultStore ? faultStore.stats() : null),
+      pending: (limit) => (faultStore ? faultStore.pendingNotifications(limit) : []),
+      raise: (input) => (faultStore ? faultStore.raise(input) : null),
+      ack: (id) => (faultStore ? faultStore.ack(id) : null),
+      interrupted: () => (faultStore ? faultStore.interruptedSessions() : []),
+      flush: () => flushFaultNotifications(),
+      render: (id) => {
+        const e = faultStore ? faultStore.get(id) : undefined
+        return e ? renderFault(e) : null
+      },
     },
   })
 }
