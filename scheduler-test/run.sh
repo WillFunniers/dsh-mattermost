@@ -912,8 +912,101 @@ print(' '.join(s))")
     || bad "T33 stray fault records from unowned sessions: $stray"
 }
 
+# --------------------------------------------------------------------------- T34
+# Log privacy and file modes.
+#
+# The plugin mirrors its logger to a durable file, so two properties must hold:
+# a user's message body never lands there, and every record stays one record.
+# The state files are rewritten through temp+rename on every inbound message, so
+# their mode must be set at creation or a `chmod` is undone within seconds.
+t34() {
+  hdr "T34  log privacy, line integrity and file modes"
+  local dir="$MMT_HOME/mattermost"
+  local log="$dir/plugin.log"
+  [ -f "$log" ] || { skip "T34 no plugin.log yet"; return; }
+
+  local stamp; stamp="$$-$(date +%s)"
+  local token="T34BODY${stamp}SECRET"
+  local line2="T34SECONDLINE${stamp}SECRET"
+  local before; before=$(stat -c '%s' "$log")
+
+  # A body containing both a marker and an embedded newline.
+  curl -s --max-time 20 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "$(python3 -c '
+import json,sys
+print(json.dumps({"channelId":sys.argv[1],"userId":sys.argv[2],
+  "message":"T34 probe "+sys.argv[3]+"\nsecond line "+sys.argv[4]}))' "$CH" "$OWNER" "$token" "$line2")" \
+    >/dev/null 2>&1 || true
+  sleep 4
+
+  # Only inspect what this test appended: the harness log legitimately contains
+  # pre-fix history, and rewriting history is not what this change promises.
+  local new; new=$(tail -c "+$((before + 1))" "$log" 2>/dev/null || true)
+
+  if printf '%s' "$new" | grep -qF "$token"; then bad "T34a message body leaked into plugin.log"
+  else ok "T34a message body absent from plugin.log"; fi
+  if printf '%s' "$new" | grep -qF "$line2"; then bad "T34a embedded second line leaked"
+  else ok "T34a whole multi-line body absent"; fi
+
+  if printf '%s' "$new" | grep -qE 'len=[0-9]+ sha=[0-9a-f]{8}'; then ok "T34b record carries a len+sha descriptor"
+  else bad "T34b no len/sha descriptor written"; fi
+
+  local broken; broken=$(printf '%s' "$new" | grep -cvE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' || true)
+  if [ "${broken:-0}" -eq 0 ]; then ok "T34c every appended line is one well-formed record"
+  else bad "T34c $broken appended line(s) broke the record structure"; fi
+
+  if printf '%s' "$new" | grep -q 'body='; then bad "T34f a body= field was written"
+  else ok "T34f no debug body field, even with debug enabled"; fi
+
+  # Unauthorized posters must not have their full user id recorded.
+  local outsider="t34outsider${stamp}"
+  curl -s --max-time 20 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "$(python3 -c '
+import json,sys
+print(json.dumps({"channelId":sys.argv[1],"userId":sys.argv[2],"message":"T34 outsider probe"}))' "$CH" "$outsider")" \
+    >/dev/null 2>&1 || true
+  sleep 3
+  if grep -qF "$outsider" "$log"; then bad "T34g unauthorized user id written in full"
+  else ok "T34g unauthorized user id is not written in full"; fi
+  if grep -qF "${outsider:0:4}…" "$log"; then ok "T34g shortened identifier kept for triage"
+  else skip "T34g no unauthorized line observed yet"; fi
+
+  # Credentials must never appear, whole or as a prefix.
+  local tokfile="${MM_TEST_TOKEN_FILE:-$HOME/.dsh/mattermost-token}"
+  local tok; tok=$(cat "$tokfile" 2>/dev/null || true)
+  if [ -n "$tok" ]; then
+    if grep -qF "$tok" "$log"; then bad "T34e full credential appears in the log"
+    else ok "T34e full credential absent from the log"; fi
+    if grep -qF "${tok:0:8}" "$log"; then bad "T34e credential prefix appears in the log"
+    else ok "T34e credential prefix absent from the log"; fi
+  else
+    skip "T34e credential file not readable"
+  fi
+
+  # Modes. plugin.log is append-only, so its mode is an operational setting:
+  # apply it, then prove appending does not loosen it. The two JSON files are
+  # rewritten by temp+rename on every message, so no setup is needed there —
+  # their mode after a write is exactly what the code sets at creation.
+  chmod 700 "$dir" 2>/dev/null || true
+  chmod 600 "$log" 2>/dev/null || true
+  curl -s --max-time 20 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "$(python3 -c '
+import json,sys
+print(json.dumps({"channelId":sys.argv[1],"userId":sys.argv[2],"message":"T34 mode probe"}))' "$CH" "$OWNER")" \
+    >/dev/null 2>&1 || true
+  sleep 4
+
+  local m_dir m_log m_state m_map
+  m_dir=$(stat -c '%a' "$dir"); m_log=$(stat -c '%a' "$log")
+  m_state=$(stat -c '%a' "$dir/state.json"); m_map=$(stat -c '%a' "$dir/session-map.json")
+  [ "$m_dir" = "700" ] && ok "T34h state directory is 700" || bad "T34h directory mode=$m_dir (want 700)"
+  [ "$m_log" = "600" ] && ok "T34h plugin.log is 600 and appending keeps it" || bad "T34h log mode=$m_log (want 600)"
+  [ "$m_state" = "600" ] && ok "T34i state.json is 600 after an atomic rewrite" || bad "T34i state.json mode=$m_state (want 600)"
+  [ "$m_map" = "600" ] && ok "T34i session-map.json is 600 after an atomic rewrite" || bad "T34i session-map.json mode=$m_map (want 600)"
+}
+
 # --------------------------------------------------------------------------- runner
-ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21 T22 T23 T24 T25 T26 T27 T28 T29 T32 T33"
+ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21 T22 T23 T24 T25 T26 T27 T28 T29 T32 T33 T34"
 WANT="${*:-$ALL}"
 require_probe
 echo "scheduler acceptance suite — session A=$SESSION  B=${SESSION_B:-none}"
@@ -925,7 +1018,7 @@ for t in $WANT; do
     T6|T17) t6 ;; T7|T18) t7 ;; T8) t8 ;; T9) t9 ;; T10) t10 ;;
     T11) t11 ;; T12) t12 ;; T13) t13 ;; T14) t14 ;; T15) t15 ;; T16) t16 ;;
     T19) t19 ;; T20) t20 ;; T21) t21 ;; T22) t22 ;;
-    T23) t23 ;; T24) t24 ;; T25) t25 ;; T26) t26 ;; T27) t27 ;; T28) t28 ;; T29) t29 ;; T32) t32 ;; T33) t33 ;;
+    T23) t23 ;; T24) t24 ;; T25) t25 ;; T26) t26 ;; T27) t27 ;; T28) t28 ;; T29) t29 ;; T32) t32 ;; T33) t33 ;; T34) t34 ;;
     *) echo "unknown test $t" ;;
   esac
 done

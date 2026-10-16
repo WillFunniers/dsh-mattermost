@@ -14,6 +14,7 @@
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { shortId } from './logsafe.js'
 
 // `ws` ships inside the DSH installation; resolve it there so this plugin needs
 // no dependency install of its own.
@@ -59,9 +60,14 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
   function saveState() {
     if (!stateFile) return
     try {
-      mkdirSync(dirname(stateFile), { recursive: true })
+      // Explicit modes: the umask (0022) would otherwise create the directory
+      // 0755 and, more importantly, every rewritten state file 0644 — and a
+      // `chmod` on the live file would be undone by the next atomic rename.
+      mkdirSync(dirname(stateFile), { recursive: true, mode: 0o700 })
       const tmp = `${stateFile}.tmp`
-      writeFileSync(tmp, JSON.stringify({ lastSeenAt, seen: seenOrder.slice(-DEDUP_MAX) }))
+      // The mode is applied when the temp file is CREATED, and `rename` carries
+      // it onto the target, so the final file stays 0600 after every save.
+      writeFileSync(tmp, JSON.stringify({ lastSeenAt, seen: seenOrder.slice(-DEDUP_MAX) }), { mode: 0o600 })
       renameSync(tmp, stateFile)
     } catch (error) {
       logger.warn(`state save failed: ${error.message}`)
@@ -247,7 +253,7 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
     loadState()
     try {
       me = await api('GET', '/users/me')
-      log(`bot identity: ${me.username} (${me.id})`)
+      log(`bot identity: ${me.username} (${shortId(me.id)})`)
     } catch (error) {
       logger.warn(`users/me failed: ${error.message}`)
     }

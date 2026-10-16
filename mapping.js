@@ -63,10 +63,13 @@ export function createSessionMap({ file, logger }) {
   /** Atomic write: temp file + rename, so a kill can never leave a torn map. */
   function persist() {
     try {
-      mkdirSync(dirname(file), { recursive: true })
+      // Explicit modes: this map is rewritten on every inbound message, so a
+      // `chmod` on the live file would be undone within seconds by the rename
+      // below. The mode must be set on the temp file that becomes the target.
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
       const payload = { version: 1, entries: Object.fromEntries(byKey) }
       const tmp = `${file}.tmp`
-      writeFileSync(tmp, JSON.stringify(payload, null, 2))
+      writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 })
       renameSync(tmp, file)
     } catch (error) {
       logger.warn(`session map save failed (${file}): ${error.message}`)

@@ -33,6 +33,7 @@ import { openJobStore } from './jobs.js'
 import { createScheduler } from './scheduler.js'
 import { registerJobTools } from './tools.js'
 import { openFaultStore, renderFault, faultId } from './faults.js'
+import { digest, oneLine, shortId } from './logsafe.js'
 
 export const name = 'dsh-mattermost'
 export const inject = ['agents', 'agentDefaultModel']
@@ -104,10 +105,14 @@ export function apply(ctx, config) {
   // these tests need evidence, not inference.
   const logFile = `${stateDir}/plugin.log`
   function write(level, message) {
-    const line = `${new Date().toISOString()} ${level} ${message}\n`
+    // `oneLine` is applied centrally so no caller can hand a raw external value
+    // (a message body, an error stack) straight into a line-oriented file.
+    const line = `${new Date().toISOString()} ${level} ${oneLine(message)}\n`
     try {
-      mkdirSync(stateDir, { recursive: true })
-      appendFileSync(logFile, line)
+      // Explicit modes: this directory holds user-adjacent operational data, and
+      // the process umask (0022) would otherwise create it 0755/0644.
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+      appendFileSync(logFile, line, { mode: 0o600 })
     } catch { /* best effort */ }
     try {
       if (level === 'ERROR') rawLogger.error(message)
@@ -269,7 +274,7 @@ export function apply(ctx, config) {
     // post must not mint a session, agent, task or outbound reply.
     if (!isAuthorized(post.user_id)) {
       stats.unauthorized += 1
-      logger.warn(`unauthorized inbound userId=${post.user_id} channelId=${post.channel_id} reason=unauthorized`)
+      logger.warn(`unauthorized inbound userId=${shortId(post.user_id)} channelId=${shortId(post.channel_id)} reason=unauthorized`)
       return
     }
     stats.authorized += 1
@@ -292,13 +297,13 @@ export function apply(ctx, config) {
       // A bot must address us explicitly; ambient bot chatter never wakes us.
       if (!isDirect && !mentioned) return
       if (!config.allowBotMentions) {
-        logger.info(`bot author ignored userId=${post.user_id} (allowBotMentions=false)`)
+        logger.info(`bot author ignored userId=${shortId(post.user_id)} (allowBotMentions=false)`)
         return
       }
       if (!botTriggerAllowed(post.channel_id)) {
         stats.chainRejected += 1
         logger.warn(
-          `bot chain budget exhausted userId=${post.user_id} channelId=${post.channel_id} ` +
+          `bot chain budget exhausted userId=${shortId(post.user_id)} channelId=${shortId(post.channel_id)} ` +
           `(${config.botChainMax} exchanges within ${config.botChainWindowMs}ms)`,
         )
         return
@@ -306,12 +311,12 @@ export function apply(ctx, config) {
       const g = chainGuard(post.channel_id)
       g.depth += 1
       g.lastBotAt = Date.now()
-      logger.info(`bot trigger accepted userId=${post.user_id} chain=${g.depth}/${config.botChainMax}`)
+      logger.info(`bot trigger accepted userId=${shortId(post.user_id)} chain=${g.depth}/${config.botChainMax}`)
     }
 
     logger.info(
-      `event post=${post.id.slice(0, 8)} ch=${post.channel_id.slice(0, 8)} ` +
-      `root=${(post.root_id || '').slice(0, 8)} bot=${botAuthor} :: ${text.slice(0, 50)}`,
+      `event post=${shortId(post.id)} ch=${shortId(post.channel_id)} ` +
+      `root=${shortId(post.root_id)} bot=${botAuthor} :: ${digest(text)}`,
     )
 
     // ---- command layer: explicit, stable, explainable ------------------------
@@ -386,7 +391,7 @@ export function apply(ctx, config) {
     agentManager.touchActivity(entry.sessionId)
     logger.info(
       `inbound ${label} session=${entry.sessionId} running=${running} mode=${mode} ` +
-      `turn=${mode === 'steer' && running ? 'steer' : 'followup'} :: ${text.slice(0, 60)}`,
+      `turn=${mode === 'steer' && running ? 'steer' : 'followup'} :: ${digest(text)}`,
     )
   }
 
