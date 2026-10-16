@@ -842,8 +842,78 @@ t32() {
     || bad "T32 $ready scheduler-ready lines for $boots boots"
 }
 
+# --------------------------------------------------------------------------- T33
+# Scope gate: `ctx.on('session/event')` is process-wide, so it also fires for
+# sessions this plugin does not own (e.g. GUI sessions). Only a session bound to
+# a Mattermost conversation can ever carry a deliverable job, so fault
+# turn-bookkeeping must be limited to those. Before the gate, an unowned
+# session's turn wrote a durable record which the NEXT boot then reported as a
+# spurious `turn-interrupted` fault.
+t33() {
+  hdr "T33  turn bookkeeping is scoped to Mattermost-owned sessions"
+  local fs="$MMT_HOME/storages/mattermost_faults/sessions"
+  local gate="session-scopegate-$(head -c 6 /dev/urandom | xxd -p)"
+
+  # Precondition: deliberately absent from session-map.json => not owned.
+  local ctx; ctx=$(curl -s --max-time 8 "$P/job/context?sessionId=$gate" | jq_ 'print(d.get("context"))')
+  [ "$ctx" = "None" ] && ok "T33 probe session is not Mattermost-bound" \
+    || { bad "T33 probe session is unexpectedly bound ($ctx)"; return; }
+
+  local owned; owned=$(curl -s --max-time 8 "$P/job/context?sessionId=$SESSION" | jq_ 'print(d.get("context") is not None)')
+  [ "$owned" = "True" ] && ok "T33 control session IS Mattermost-bound" \
+    || bad "T33 control session $SESSION is not bound - harness state unexpected"
+
+  # Drive a REAL turn in it via the scheduler - the same wake a due job performs.
+  local at; at=$(now_ms)
+  local id; id=$(create reminder "$gate" "$at" "[T33] scope-gate probe")
+  [ -n "$id" ] || { bad "T33 could not create the probe job"; return; }
+  tick
+
+  local live=False
+  for _ in $(seq 1 10); do
+    live=$(curl -s --max-time 8 "$P/agent?sessionId=$gate" | jq_ 'print(d.get("live"))')
+    [ "$live" = "True" ] && break
+    sleep 2
+  done
+  [ "$live" = "True" ] && ok "T33 a turn really opened in the unowned session" \
+    || bad "T33 no turn opened - the scope assertion would be vacuous"
+
+  [ -f "$fs/$gate.json" ] \
+    && bad "T33 fault bookkeeping written for an UNOWNED session" \
+    || ok "T33 no fault bookkeeping for the unowned session"
+
+  # Positive control: an owned Mattermost session is still traced open -> closed.
+  local t0; t0=$(now_ms)
+  curl -s --max-time 30 -X POST "$P/inject" -H 'Content-Type: application/json' \
+    -d "{\"channelId\":\"$CH\",\"userId\":\"$OWNER\",\"message\":\"[T33] owned control\"}" \
+    >/dev/null 2>&1 || true
+  local closed=False
+  for _ in $(seq 1 20); do
+    closed=$(python3 -c "
+import json, os
+p = '$fs/$SESSION.json'
+r = json.load(open(p))['record'] if os.path.exists(p) else None
+print(r is not None and r['turnOpen'] is False and (r.get('closedAt') or 0) >= $t0)")
+    [ "$closed" = "True" ] && break
+    sleep 5
+  done
+  [ "$closed" = "True" ] && ok "T33 owned session traced open->closed ($SESSION)" \
+    || bad "T33 owned session was not traced"
+
+  # Store-wide invariant: no unowned session may be present at all.
+  local stray; stray=$(python3 -c "
+import json, os
+m = json.load(open('$MMT_HOME/mattermost/session-map.json'))['entries']
+owned = {v['sessionId'] for v in m.values()}
+d = '$fs'
+s = sorted(f[:-5] for f in os.listdir(d) if f.endswith('.json') and f[:-5] not in owned) if os.path.isdir(d) else []
+print(' '.join(s))")
+  [ -z "$stray" ] && ok "T33 every fault-tracked session is Mattermost-owned" \
+    || bad "T33 stray fault records from unowned sessions: $stray"
+}
+
 # --------------------------------------------------------------------------- runner
-ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21 T22 T23 T24 T25 T26 T27 T28 T29 T32"
+ALL="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T19 T20 T21 T22 T23 T24 T25 T26 T27 T28 T29 T32 T33"
 WANT="${*:-$ALL}"
 require_probe
 echo "scheduler acceptance suite — session A=$SESSION  B=${SESSION_B:-none}"
@@ -855,7 +925,7 @@ for t in $WANT; do
     T6|T17) t6 ;; T7|T18) t7 ;; T8) t8 ;; T9) t9 ;; T10) t10 ;;
     T11) t11 ;; T12) t12 ;; T13) t13 ;; T14) t14 ;; T15) t15 ;; T16) t16 ;;
     T19) t19 ;; T20) t20 ;; T21) t21 ;; T22) t22 ;;
-    T23) t23 ;; T24) t24 ;; T25) t25 ;; T26) t26 ;; T27) t27 ;; T28) t28 ;; T29) t29 ;; T32) t32 ;;
+    T23) t23 ;; T24) t24 ;; T25) t25 ;; T26) t26 ;; T27) t27 ;; T28) t28 ;; T29) t29 ;; T32) t32 ;; T33) t33 ;;
     *) echo "unknown test $t" ;;
   esac
 done

@@ -634,6 +634,14 @@ export function apply(ctx, config) {
         // delivery semantics must not change. The event subscription already
         // existed, so this adds no new listener lifecycle.
         if (!faultStore) return
+        // `session/event` is process-wide: it also fires for GUI sessions this
+        // plugin does not own. Only a session bound to a Mattermost conversation
+        // can ever carry a deliverable job, so tracking anything else would grow
+        // the fault store without bound and raise turn-interrupted faults for
+        // work that is none of this plugin's business. `targets` is the durable
+        // sessionId -> Mattermost home map: restored from session-map.json at
+        // startup and populated on inbound before the first turn opens.
+        if (!targets.has(String(session.id))) return
         if (event && event.type === 'turn/start') {
           faultStore.turnOpened(String(session.id), event.data?.turn)
             .catch((error) => logger.warn(`fault turn-open failed: ${error.message}`))
