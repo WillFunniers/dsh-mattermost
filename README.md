@@ -1,5 +1,7 @@
 # dsh-mattermost
 
+**English** | [简体中文](./README.zh-CN.md)
+
 A native [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plugin that turns Mattermost into a task entry point for DSH agents.
 
 Instead of running an external bridge process, `dsh-mattermost` loads **inside the DSH Web process** and drives an in-process agent. When the DSH Web process is running, Mattermost and the DSH Web GUI operate on the same live agent/session within that process.
@@ -604,7 +606,7 @@ The plugin is plain ESM JavaScript. There is no build step, no bundler, and no r
 }
 ```
 
-There is currently no test suite and no lint or build script in this repository.
+There is no lint or build script in this repository. `scheduler-test/` holds a separate acceptance suite (with its own README) that runs against an isolated harness; it is not part of the plugin runtime.
 
 ### Layout
 
@@ -616,6 +618,7 @@ mattermost.js   Mattermost transport: WebSocket inbound, REST outbound
 outbound.js     session/event → adapter delivery
 markdown.js     reply splitting
 cordis.patch.yml  bundle patch: the loader row and its default config
+scheduler-test/   acceptance suite (isolated harness; see its own README)
 ```
 
 ### Contributing
@@ -647,6 +650,4 @@ The current baseline has been exercised with long-running tasks, concurrent sess
 
 ## License
 
-No `LICENSE` file is present in this repository yet.
-
-`package.json` currently declares `"license": "MIT"`, but the corresponding license text has not been added. Until a license file is committed, no license is granted.
+MIT — see [LICENSE](./LICENSE). Copyright (c) 2026 WillFunniers.
