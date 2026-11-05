@@ -24,12 +24,14 @@ const WebSocket = require('ws')
 const PING_INTERVAL_MS = 30_000
 const DEDUP_MAX = 5_000
 
-export function createMattermostClient({ baseUrl, token, logger, stateFile, debug }) {
+export function createMattermostClient({ baseUrl, token, botId = 'bot0', logger, stateFile, debug }) {
   let ws = null
   let pingTimer = null
   let retryDelay = 1_000
   let closedByUs = false
   let started = false
+  // `{ onPost, onReaction }` — set by start(). A bare function is still accepted
+  // and treated as `onPost`, so nothing that predates reactions has to change.
   let handler = null
 
   let me = null
@@ -87,11 +89,15 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
   }
 
   // ---------------------------------------------------------------------- REST
-  async function api(method, path, body) {
+  async function api(method, path, body, { timeoutMs } = {}) {
     const res = await fetch(`${baseUrl}/api/v4/${path.replace(/^\//, '')}`, {
       method,
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
+      // Reads used while deciding where to announce an approval must not hang: a
+      // stalled probe would delay or lose the announcement. Sends keep the
+      // default (no client timeout) because they carry the user's message.
+      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
     })
     if (res.status === 204) return undefined
     const data = await res.json().catch(() => ({}))
@@ -111,7 +117,7 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
    * Measured before this existed: 1 reply in 10 was lost to a `fetch failed`
    * during a suspend/resume transition.
    */
-  async function send(channelId, message, rootId) {
+  async function send(channelId, message, rootId, props) {
     let useRoot = rootId
     let lastError
     for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -120,6 +126,7 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
           channel_id: channelId,
           message,
           ...(useRoot ? { root_id: useRoot } : {}),
+          ...(props ? { props } : {}),
         })
         state.replies += 1
         if (attempt > 1) log(`delivered after ${attempt} attempts`)
@@ -147,8 +154,23 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
     try { await api('POST', `/users/${me.id}/typing`, { channel_id: channelId }) } catch { /* best effort */ }
   }
 
+  /** Reads used to place an approval notification must answer quickly or not at all. */
+  const PROBE_TIMEOUT_MS = 3_000
+
   async function fetchChannel(channelId) {
-    try { return await api('GET', `/channels/${channelId}`) } catch { return undefined }
+    try { return await api('GET', `/channels/${channelId}`, undefined, { timeoutMs: PROBE_TIMEOUT_MS }) } catch { return undefined }
+  }
+
+  /**
+   * Channel members, as `[{ user_id }]`.
+   *
+   * Needed to answer a question a chat *key* cannot: is this conversation a
+   * one-to-one DM? The key is `dm:<channelId>`, which only says the channel was
+   * created as a DM — a group DM (type `G`) and a direct channel that gained a
+   * third member are both possible. Only the member list can settle it.
+   */
+  async function fetchMembers(channelId) {
+    try { return await api('GET', `/channels/${channelId}/members?per_page=200`, undefined, { timeoutMs: PROBE_TIMEOUT_MS }) } catch { return undefined }
   }
 
   /**
@@ -188,7 +210,30 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
   }
 
   // ----------------------------------------------------------------- WebSocket
-  function connect(onPost) {
+  /** Normalize the `start()` argument: a function means "post handler only". */
+  function asHandlers(value) {
+    if (typeof value === 'function') return { onPost: value, onReaction: null }
+    if (value && typeof value === 'object') {
+      return {
+        onPost: typeof value.onPost === 'function' ? value.onPost : null,
+        onReaction: typeof value.onReaction === 'function' ? value.onReaction : null,
+      }
+    }
+    return { onPost: null, onReaction: null }
+  }
+
+  /** Parse one reaction frame's `data.reaction` (a JSON string in the protocol). */
+  function reactionOf(frame) {
+    let reaction = frame.data?.reaction
+    if (typeof reaction === 'string') {
+      try { reaction = JSON.parse(reaction) } catch { return undefined }
+    }
+    if (!reaction || typeof reaction !== 'object') return undefined
+    if (!reaction.post_id || !reaction.user_id || !reaction.emoji_name) return undefined
+    return reaction
+  }
+
+  function connect(handlers) {
     if (ws || closedByUs) return
     const wsUrl = `${baseUrl.replace(/^http/, 'ws')}/api/v4/websocket`
     const socket = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${token}` } })
@@ -198,29 +243,63 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
       retryDelay = 1_000
       state.connected = true
       log(`websocket connected (bot ${me ? me.username : '?'})`)
-      try { await backfill(onPost) } catch { /* logged inside */ }
+      try { await backfill(handlers.onPost) } catch { /* logged inside */ }
     })
 
     socket.on('message', (raw) => {
       let frame
       try { frame = JSON.parse(String(raw)) } catch { return }
-      if (frame.event !== 'posted') return
-      let post = frame.data?.post
-      if (typeof post === 'string') { try { post = JSON.parse(post) } catch { return } }
-      if (!post || !post.id || !post.channel_id || !post.user_id) return
-      if (!markSeen(post.id)) return
-      if (Number.isFinite(post.create_at) && post.create_at > lastSeenAt) {
-        lastSeenAt = post.create_at
-        saveState()
+      // Exactly two event families are consumed. Everything else is dropped
+      // HERE — before any handler exists to misread it, and before anything can
+      // mark a post id as seen. A reaction must never reach the post pipeline:
+      // reactions carry no message body, so the post handler would either
+      // crash-adjacent no-op or (worse) consume the shared dedup slot.
+      if (frame.event === 'posted') {
+        let post = frame.data?.post
+        if (typeof post === 'string') { try { post = JSON.parse(post) } catch { return } }
+        if (!post || !post.id || !post.channel_id || !post.user_id) return
+        // `me` decides whether a post is our own. Acting before the identity is
+        // known could answer ourselves and start a loop, so an unattributable
+        // frame is dropped rather than guessed at. (Normally `me` is known
+        // before the socket exists; only the test-only fast resume races it.)
+        if (!me) return
+        if (!markSeen(post.id)) return
+        if (Number.isFinite(post.create_at) && post.create_at > lastSeenAt) {
+          lastSeenAt = post.create_at
+          saveState()
+        }
+        const channel = {
+          id: post.channel_id,
+          type: frame.data?.channel_type,
+          name: frame.data?.channel_name,
+          display_name: frame.data?.channel_display_name,
+        }
+        Promise.resolve(handlers.onPost(post, channel, false)).catch((error) =>
+          logger.error(`post handler failed: ${error.stack || error.message}`))
+        return
       }
-      const channel = {
-        id: post.channel_id,
-        type: frame.data?.channel_type,
-        name: frame.data?.channel_name,
-        display_name: frame.data?.channel_display_name,
+
+      if (frame.event === 'reaction_added' || frame.event === 'reaction_removed') {
+        if (!handlers.onReaction) return
+        const reaction = reactionOf(frame)
+        if (!reaction) return
+        // Transport-level visibility for approval diagnosis: which reaction,
+        // on which post, by whom. Ids are shortened; no message text exists in a
+        // reaction frame, so there is nothing else to leak.
+        dbg(`reaction ${frame.event === 'reaction_removed' ? 'removed' : 'added'} post=${shortId(reaction.post_id)} ` +
+            `user=${shortId(reaction.user_id)} emoji=${reaction.emoji_name}`)
+        // Our own acknowledgement reaction must never count as a decision.
+        if (me && reaction.user_id === me.id) return
+        Promise.resolve(handlers.onReaction({
+          removed: frame.event === 'reaction_removed',
+          postId: reaction.post_id,
+          userId: reaction.user_id,
+          emojiName: reaction.emoji_name,
+          channelId: reaction.channel_id,
+          createAt: reaction.create_at,
+        })).catch((error) => logger.error(`reaction handler failed: ${error.stack || error.message}`))
+        return
       }
-      Promise.resolve(onPost(post, channel, false)).catch((error) =>
-        logger.error(`post handler failed: ${error.stack || error.message}`))
     })
 
     socket.on('close', (code) => {
@@ -230,7 +309,7 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
       if (closedByUs) return
       state.reconnects += 1
       log(`websocket closed (${code}); reconnect in ${retryDelay}ms`)
-      setTimeout(() => connect(onPost), retryDelay)
+      setTimeout(() => connect(handlers), retryDelay)
       retryDelay = Math.min(60_000, retryDelay * 2)
     })
 
@@ -245,18 +324,31 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
   }
 
   // -------------------------------------------------------------------- public
-  async function start(onPost) {
-    if (onPost) handler = onPost
+  async function refreshIdentity() {
+    try {
+      me = await api('GET', '/users/me')
+      log(`bot identity: ${me.username} (${shortId(me.id)})`)
+      return me
+    } catch (error) {
+      logger.warn(`users/me failed: ${error.message}`)
+      return undefined
+    }
+  }
+
+  /**
+   * @param onPost - handlers, or a bare post handler.
+   * @param options.identity - `'await'` (boot: know ourselves before listening)
+   *   or `'background'` (fast reconnect: the socket is up immediately and posts
+   *   are ignored until the identity arrives).
+   */
+  async function start(onPost, { identity = 'await' } = {}) {
+    if (onPost) handler = asHandlers(onPost)
     if (started) return
     started = true
     closedByUs = false
     loadState()
-    try {
-      me = await api('GET', '/users/me')
-      log(`bot identity: ${me.username} (${shortId(me.id)})`)
-    } catch (error) {
-      logger.warn(`users/me failed: ${error.message}`)
-    }
+    if (identity === 'await') await refreshIdentity()
+    else void refreshIdentity()
     connect(handler)
   }
 
@@ -271,7 +363,7 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
     if (!handler) return false
     started = false
     closedByUs = false
-    await start(handler)
+    await start(handler, { identity: 'background' })
     return true
   }
 
@@ -286,6 +378,29 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
   }
 
   /**
+   * Create one interactive card post and return its id.
+   * A missing id is a delivery failure, not a "no card" outcome — callers treat
+   * it as such (the approval bridge fails closed rather than waiting forever).
+   */
+  async function sendCard(channelId, rootId, card) {
+    const created = await send(channelId, card.message, rootId, card.props)
+    return created && created.id ? String(created.id) : undefined
+  }
+
+  /**
+   * Rewrite an existing post in place (a card's status line).
+   *
+   * `PUT /posts/{id}` is author-only, which is why the bot must be the one that
+   * posted the card. No retry: a stale card is cosmetic, and retrying an edit
+   * during an outage would only delay the caller.
+   */
+  async function updatePost(postId, card) {
+    if (!postId) return false
+    await api('PUT', `/posts/${postId}`, { id: postId, message: card.message, props: card.props })
+    return true
+  }
+
+  /**
    * TEST-ONLY: simulate an abrupt transport loss. Deliberately does NOT set
    * closedByUs, so the close handler treats it as a real drop and reconnects,
    * which is what exercises backfill + dedup.
@@ -297,5 +412,10 @@ export function createMattermostClient({ baseUrl, token, logger, stateFile, debu
     return true
   }
 
-  return { start, stop, suspend, resume, send, sendTyping, fetchChannel, api, state, markSeen, saveState, dropSocket, get me() { return me } }
+  return {
+    botId,
+    start, stop, suspend, resume, send, sendCard, updatePost, sendTyping, fetchChannel, fetchMembers,
+    api, state, markSeen, saveState, dropSocket,
+    get me() { return me },
+  }
 }

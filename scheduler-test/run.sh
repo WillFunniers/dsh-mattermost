@@ -13,9 +13,12 @@ set -u
 
 # Harness locations. Neither is baked in: point them at your own setup.
 MMT_HOME="${MMT_HOME:-$HOME/.dsh-mmt-test}"
+# Which isolated profile the harness runs. The TTL gate matches this phrase
+# exactly (plus exe == node), so it can never latch onto production or a shell.
+MMT_PROFILE="${MMT_PROFILE:-mmt-test}"
 BIN="${MMT_BIN:?set MMT_BIN to the harness checkout that holds restart-test.sh and mm.sh}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-P=http://127.0.0.1:3091
+P="${PROBE:-http://127.0.0.1:3091}"
 CH="${MM_TEST_CHANNEL:?set MM_TEST_CHANNEL to your Mattermost channel id}"
 OWNER="${MM_TEST_OWNER:?set MM_TEST_OWNER to your authorized Mattermost user id}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -178,14 +181,14 @@ sched()    { curl -s --max-time 8 "$P/jobs" | jq_ 'print(json.dumps(d["scheduler
 SESSION=$(python3 -c "
 import json
 m=json.load(open('$MMT_HOME/mattermost/session-map.json'))['entries']
-pref=[k for k in m if k.startswith('ch:')]
+pref=[k for k in m if ':'.join(k.split(':')[-2:-1]) == 'ch']
 print(m[(pref or list(m))[0]]['sessionId'])
 ")
 # Two distinct sessions, for isolation tests.
 SESSION_B=$(python3 -c "
 import json
 m=json.load(open('$MMT_HOME/mattermost/session-map.json'))['entries']
-ks=[k for k in m if k.startswith('th:')]
+ks=[k for k in m if ':'.join(k.split(':')[-2:-1]) == 'th']
 print(m[ks[0]]['sessionId'] if ks else '')
 ")
 
@@ -446,9 +449,11 @@ t9() {
   # requeued-pending, not fired by the next automatic tick.
   local at2; at2=$(($(now_ms)+3600000))
   local id2; id2=$(create reminder "$SESSION" "$at2" "[T9B] crash window")
-  python3 - "$id2" <<'PY'
+  python3 - "$id2" "$MMT_HOME" <<'PY'
 import json, sys, pathlib
-p = pathlib.Path('$MMT_HOME/storages/mattermost_jobs/jobs') / (sys.argv[1] + '.json')
+# The home is passed as an ARGUMENT: a single-quoted heredoc does not expand
+# shell variables, and interpolating one here made this fixture a no-op.
+p = pathlib.Path(sys.argv[2], 'storages', 'mattermost_jobs', 'jobs') / (sys.argv[1] + '.json')
 d = json.loads(p.read_text())
 r = d['record']
 r.update(status='running', claimId='deadbeefdeadbeef', claimedAt=1, attempts=1, dispatchedAt=None)
@@ -550,7 +555,7 @@ t12() {
   local sid; sid=$(python3 -c "
 import json
 m=json.load(open('$MMT_HOME/mattermost/session-map.json'))['entries']
-ks=[k for k in m if k.startswith('th:')]
+ks=[k for k in m if ':'.join(k.split(':')[-2:-1]) == 'th']
 print(m[ks[-1]]['sessionId'] if ks else '')
 ")
   [ -z "$sid" ] && { skip "T12 no alternate session"; return; }
@@ -1349,6 +1354,9 @@ print(r is not None and r['turnOpen'] is False and (r.get('closedAt') or 0) >= $
 import json, os
 m = json.load(open('$MMT_HOME/mattermost/session-map.json'))['entries']
 owned = {v['sessionId'] for v in m.values()}
+for v in m.values():
+    for h in (v.get('history') or []):
+        owned.add(h['sessionId'])
 d = '$fs'
 s = sorted(f[:-5] for f in os.listdir(d) if f.endswith('.json') and f[:-5] not in owned) if os.path.isdir(d) else []
 print(' '.join(s))")
@@ -1543,7 +1551,7 @@ harness_ttl_ms() {
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
     case "$exe" in */node|*/nodejs) ;; *) continue ;; esac
     cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-    case "$cmd" in *"dsh --profile mmt-test"*) ;; *) continue ;; esac
+    case "$cmd" in *"dsh --profile $MMT_PROFILE"*) ;; *) continue ;; esac
     hits=$((hits + 1)); hit="$pid"
   done
   if [ "$hits" -eq 0 ]; then
