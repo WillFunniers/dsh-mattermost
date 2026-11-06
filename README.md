@@ -34,6 +34,9 @@ Mattermost  ──WebSocket──▶  dsh-mattermost  ──▶  DSH Web process
 - **Idle agent eviction** — the runtime agent is released after a period of inactivity while the durable session is kept.
 - **Default-deny authorization** — user and channel allowlists.
 - **Bot-loop protection** — a per-channel budget limits bot-to-bot exchanges.
+- **Approval Bridge** — DSH's native one-shot approval requests are posted as a Mattermost card and settled by a reaction or a reply command, through the native `approval/request` waterfall. Fail-closed: no card, no decision, no grant.
+- **Session Navigator** — `/sessions`, `/session` and `/switch` list and re-point the current conversation's own sessions; other threads, users and bots are never touched.
+- **Multiple bots** — one plugin instance can drive several Mattermost bot accounts with independent tokens, WebSocket connections, state files, authorization sets and session namespaces.
 
 ---
 
@@ -227,6 +230,10 @@ unauthorized inbound userId=<id> channelId=<id> reason=unauthorized
 
 The bot also never reacts to its own posts.
 
+### Reporting a vulnerability
+
+Please use GitHub's private vulnerability reporting for this repository if it is enabled; otherwise contact the maintainer through the repository's existing channel. No security email address is published here.
+
 ### Bot loop protection
 
 Two bots that auto-reply to each other can loop indefinitely:
@@ -251,36 +258,66 @@ Never commit Mattermost credentials to the repository. Provide the token through
 
 ## Installation
 
-This repository currently targets **source-based installation within DSH**. There is no published npm package, no build step, and no runtime dependency of its own — it resolves its DSH imports from the DSH installation.
+This is a **source-installed DSH plugin**, not a standalone Node application. It requires:
 
-1. Clone the repository somewhere stable:
+- **DSH 0.2.1-rc.2** — the host supplies the `@deepseek-ai/dsh-*` runtime packages declared as `peerDependencies`.
+- **Node.js 24** and **pnpm** (the validated toolchain).
+- One plugin-owned dependency, `@deepseek-ai/schemastery` (`~3.18.5`), installed by the steps below.
+
+The plugin does not install the six DSH runtime peer packages itself. DSH resolves them from its own installation. `pnpm-workspace.yaml` sets `autoInstallPeers: false` so a local install does not create a second, potentially incompatible copy. Do not add those peers to the profile.
+
+1. Clone and install the plugin-owned dependency:
 
    ```bash
    git clone https://github.com/WillFunniers/dsh-mattermost.git
+   cd dsh-mattermost
+   pnpm install --prod --ignore-scripts
    ```
 
-2. Install it into a DSH profile. A profile is a directory under `$DSH_HOME/profiles/<name>` with a `package.json` and a `cordis.patch.yml`.
+   This installs only `@deepseek-ai/schemastery`. Run it before linking the checkout: `dsh plugin add` records a `link:` dependency and does not install a link target's dependencies.
 
-   Make the package resolvable from the profile and add it to the profile's bundle list:
+2. Install into a DSH profile. For a new `DSH_HOME`, the simplest path is the shipped `web` profile:
 
    ```bash
-   ln -s /path/to/dsh-mattermost $DSH_HOME/profiles/<profile>/node_modules/dsh-mattermost
+   dsh plugin --profile web add /path/to/dsh-mattermost
    ```
 
-   Then append `dsh-mattermost` to the `dsh.profile.bundles` array in `$DSH_HOME/profiles/<profile>/package.json`.
+   For another profile, replace `web`. A newly initialized profile that will serve the Web UI must include `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` in `dsh.profile.bundles`.
+
+   Manual alternative for development:
+
+   ```bash
+   dsh plugin --profile web list   # initialize the profile
+   mkdir -p "$DSH_HOME/profiles/web/node_modules"
+   ln -s /path/to/dsh-mattermost "$DSH_HOME/profiles/web/node_modules/dsh-mattermost"
+   # append "dsh-mattermost" to dsh.profile.bundles in profiles/web/package.json
+   ```
 
 3. The plugin's own `cordis.patch.yml` inserts its loader row. Override its `config` from the profile's `cordis.patch.yml` if you want profile-specific values (see below).
 
 4. Restart DSH Web so the profile is re-read.
 
-After startup, the plugin logs its resolved configuration and connects:
+5. Verify activation:
 
-```
-ready (cwd=..., channels=..., allowedUsers=..., botChainMax=5, idleTtlMs=1800000)
-websocket connected
-```
+   ```bash
+   tail -n 20 "$DSH_HOME/mattermost/plugin.log"
+   dsh --profile web --dump-config | grep -A2 'dsh-mattermost'
+   ```
 
-If credentials are missing, the plugin stays idle and logs why instead of taking DSH down.
+   Look for `apply() entered`, `web approval routing enabled=no`, and no `failed to import` / `ERR_MODULE_NOT_FOUND`. If credentials are missing, the plugin waits and logs why instead of taking DSH down.
+
+### Troubleshooting installation
+
+- `ERR_MODULE_NOT_FOUND: @deepseek-ai/schemastery`: step 1 was skipped or failed. Run `pnpm install --prod --ignore-scripts` in the checkout.
+- `Cannot find package '@deepseek-ai/dsh-*'`: the DSH host is not 0.2.1-rc.2, or it does not supply the declared peers. Install the matching DSH release.
+- The plugin row is absent from `--dump-config`: it is not in `dsh.profile.bundles`; add it.
+- `failed to import` with another module: run the clean-install smoke test and include the full log.
+
+### Clean-install smoke test
+
+`feature-test/clean-install-smoke.sh` creates a temporary `DSH_HOME`, installs the checkout with the commands above, boots DSH, and asserts the plugin row activates with Web Approval off. It needs `dsh`, `pnpm`, and registry access; it never reads production config or credentials.
+
+Known limits: the live Mattermost E2E and scheduler suites need an isolated Mattermost instance; the smoke test deliberately does not connect to one.
 
 ---
 
@@ -307,6 +344,12 @@ Every field below is read from the plugin's `Config` schema. All keys are option
 | `stateDir` | string | `''` | State directory. Empty means `$DSH_HOME/mattermost`. |
 | `backfill` | boolean | `true` | Catch up on missed posts after a reconnect. |
 | `maxReplyChars` | number | `12000` | Maximum characters per outbound message before splitting. |
+| `approvalEnabled` | boolean | `true` | Answer native approval requests from Mattermost. `false` makes every request fall through to the next answerer (the Web UI), exactly as before. It never overrides DSH's own policy. |
+| `approvalTimeoutMs` | number | `300000` | How long a posted approval card may stay open. An unanswered card resolves `unavailable`, i.e. the action is denied. |
+| `webApproval` | object | all off | Where an approval raised by a DSH **Web** session may be announced. Empty `approvers` = off; actionable cards are one-to-one DM only. See *Web-origin approval notifications*. |
+| `approvalCardArguments` | string | `off` | `off` hides the tool arguments on **Web-origin** cards; `masked` shows them masked. Mattermost-origin cards are unchanged. |
+| `navigatorLimit` | number | `8` | How many sessions of the current conversation `/sessions` prints. |
+| `bots` | object[] | `[]` | Additional bot accounts. Empty means the flat fields above describe the only bot. See [Multiple bots](#multiple-bots). |
 | `debug` | boolean | `false` | Verbose adapter logging. |
 
 ### Example
@@ -422,6 +465,167 @@ Start a fresh conversation for the current chat:
 ```
 /new
 ```
+
+`/new` advances the conversation to its next generation. The previous sessions are kept — they
+remain resumable and reachable through `/switch`.
+
+### `/sessions` and `/session`
+
+List this conversation's own sessions, and show the one you are in:
+
+```
+/sessions
+/session
+```
+
+Only sessions this conversation created are listed: other threads, other users and other bots
+are never scanned or shown, and DSH Web sessions are never touched.
+
+### `/switch`
+
+Point this conversation at one of its earlier sessions:
+
+```
+/switch 1              # by index, as printed by /sessions
+/switch mm-1a2b3c4d    # by session id prefix
+```
+
+A switch only rewrites this conversation's mapping. It is refused while the current or the target
+session has a turn in flight, and it can never make two conversations share one live agent.
+
+### Approvals
+
+When the agent asks for permission to do something outside its sandbox, the request is posted as a
+card in the conversation. Answer it in either way:
+
+```
+(add ✅ to the card)         approve this one request
+(add ❌ to the card)         reject it
+/approve 1a2b3c4d             approve by id
+/reject 1a2b3c4d              reject by id
+/approvals                    list what is still pending here
+```
+
+Only a user authorized for that bot, in the channel where the request was posted, can decide, and
+only once. Everything else — an expired card, a duplicate click, an unreachable Mattermost, an
+ambiguous state — leaves the request **denied**.
+
+The card shows the tool, the reason, the originating session, and the tool's arguments where they
+can be recovered from the session log — masked (credentials removed) and truncated to 800
+characters. The arguments are shown for context only; they are never used as an authorization
+input, and they are never written to the plugin log.
+
+A decision is refused with one of these codes, and none of them is retried automatically:
+
+| Code | Meaning |
+| --- | --- |
+| `unknown` | No such request (a forged id, or one this process never saw). |
+| `settled` | Already decided — the first answer wins. |
+| `expired` | Past its deadline; the request is closed as `unavailable`. |
+| `forbidden` | Wrong bot for this request, or a Web-origin card that is not a one-to-one DM. |
+| `not-allowed` | Not authorized for that bot, or not the single configured approver of a Web-origin request. |
+| `wrong-channel` | The decision came from a conversation other than the one the card lives in. |
+| `not-posted` | No card was ever delivered for this request (e.g. the Web notification failed). |
+
+Pending approvals live in this process only. After a plugin restart they are gone: cards that are
+still visible in Mattermost become **orphans** — no reaction or command can decide them any more,
+and they cannot collide with a newer request.
+
+#### Web-origin approval notifications — one-to-one DM only
+
+A request raised by a DSH **Web** session is answered by the browser prompt, and that remains the
+primary entry point. This plugin may additionally announce it in Mattermost, under one rule:
+
+> **An actionable card may only be delivered to a verified one-to-one DM whose single peer is the
+> single configured approver.**
+
+```yaml
+webApproval:
+  channel: ''        # P1  fixed conversation (channel id, ch: or dm: key)
+  binding: {}        # P2  { botId: chatKey } — explicit conversation
+  auto: false        # P3  single-user inference
+  ttlMs: 86400000    # 24h — how old a conversation may be and still be used
+  approvers: []      # the ONE user allowed to decide a Web-origin request
+
+approvalCardArguments: 'off'   # 'off' (default) or 'masked' — Web cards only
+```
+
+The order is fixed: fixed conversation, then per-bot binding, then inference, then nothing. A broken
+explicit destination stops the route — it never falls back to a guess, never broadcasts and never
+creates a DM.
+
+Whether a conversation is "one-to-one" is decided from the Mattermost **channel record and its member
+list**, never from the `dm:` key prefix: a group DM (`type: G`) and a DM that gained a third member
+are both possible. The resulting modes are:
+
+| Destination | Result |
+| --- | --- |
+| verified 1:1 DM, peer = the approver | **actionable card** (✅ / ❌ / `/approve <id>`) |
+| channel, group DM, thread | **notice only** — no request id, no tool name, no arguments, no way to decide |
+| several approvers, peer ≠ approver, unreadable membership | **nothing** |
+
+A card delivery failure never decides the request: the browser prompt keeps working, and the record
+simply expires if nobody answers. If the browser answers first, the card is rewritten as void.
+
+`approvers` must be a subset of `allowedUsers`. A configuration that reaches beyond it is rejected
+at startup and the feature stays off. A destination is not a permission: landing a card in a
+conversation grants nobody the right to answer it.
+
+Mattermost-origin cards are **not** affected by any of this: they keep their existing behaviour,
+including masked arguments and their channel/thread placement.
+
+---
+
+## Multiple Bots
+
+One plugin instance can drive several Mattermost bot accounts. Each bot gets its own token
+reference, WebSocket connection, reconnect loop, dedup/backfill state file, authorization set,
+channel allowlist and session-key namespace.
+
+```yaml
+- id: mattermost
+  name: dsh-mattermost
+  config:
+    cwd: /srv/workspace
+    # Flat fields remain the defaults every bot inherits.
+    allowedUsers: ['<user-id>']
+    bots:
+      - id: dsh              # first bot: keeps the historical keys and state.json
+        tokenRef: MATTERMOST_TOKEN
+        channels: ['<channel-id>']
+        freeResponseChannels: ['<channel-id>']
+      - id: dsh-ops
+        tokenRef: MATTERMOST_TOKEN_OPS
+        channels: ['<ops-channel-id>']
+        allowedUsers: ['<ops-user-id>']
+```
+
+Omitted fields inherit the flat configuration. Bot ids are restricted to `[A-Za-z0-9._-]` and must
+be unique; a malformed or duplicated id fails the plugin at load rather than silently collapsing
+two bots into one namespace.
+
+### What is isolated
+
+| Layer | Isolated? | How |
+| --- | --- | --- |
+| Credentials | Yes | One token reference per bot. |
+| Transport | Yes | One WebSocket, reconnect loop and dedup/backfill cursor per bot; dropping one socket does not reconnect the others. |
+| Session mapping | Yes | Durable keys are `b<botId>:<chatKey>` and the bot id is part of the session-id hash, so two bots in the same channel or thread never share a session. |
+| Authorization | Yes | Each bot has its own `allowedUsers` / `allowAll` / channel allowlist. |
+| Approvals | Yes | A request records the bot that owns the session; a decision from another bot is refused. |
+| Delivery | Yes | Replies go out through the bot that owns the session. |
+| Agent runtime | **No** | All bots run agents in the same DSH process with the same tool permissions, working directory and filesystem access. |
+
+**This is routing and data isolation, not a security sandbox.** Multiple bots do not give their
+users separate tool permissions or separate filesystems. Do not describe a multi-bot deployment as
+one.
+
+### Upgrading an existing single-bot deployment
+
+Nothing to do. The first configured bot owns the pre-multi-bot namespace: a mapping stored under
+the bare `<chatKey>` is still read, and is mirrored (never moved, never deleted) into
+`b<botId>:<chatKey>` the first time it is used, preserving the session id, its generation and its
+history. New conversations are written under the new namespace.
 
 ---
 
@@ -594,7 +798,7 @@ Current, known limitations:
 
 ## Development
 
-The plugin is plain ESM JavaScript. There is no build step, no bundler, and no runtime dependency of its own — imports of `@deepseek-ai/*` packages resolve from the DSH installation.
+The plugin is plain ESM JavaScript. There is no build step or bundler. It has one installed dependency (`@deepseek-ai/schemastery`) and six `@deepseek-ai/dsh-*` peers supplied by the DSH host; `node_modules` is not committed.
 
 `package.json` declares a `dsh.bundle.patch` entry, which is what makes the package loadable as a DSH bundle:
 
@@ -602,29 +806,50 @@ The plugin is plain ESM JavaScript. There is no build step, no bundler, and no r
 {
   "type": "module",
   "main": "index.js",
+  "dependencies": { "@deepseek-ai/schemastery": "~3.18.5" },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-credentials": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.1-rc.2"
+  },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
 }
 ```
 
 There is no lint or build script in this repository. `scheduler-test/` holds a separate acceptance suite (with its own README) that runs against an isolated harness; it is not part of the plugin runtime.
 
+### Deployment checks
+
+`deploy/preflight.sh` and `deploy/verify.sh` are **read-only** checks for a production rollout. `preflight.sh` inspects configuration, the credential reference, the bot identity, pending approvals (full pagination across the whitelisted channels), the Git baseline and commit chain, an optional bundle and the service state. `verify.sh` checks the deployed commit, worktree, config hash, service stability, logs, identity and pending approvals. Both print `PASS`/`FAIL`/`UNKNOWN` and exit non-zero when anything is not `PASS`; they never merge, reset, restart or send Mattermost messages — those actions stay manual and explicitly authorized.
+
+`deploy/tests/run-tests.sh` runs the isolated suite against a mock Mattermost and a scratch Git repository. Paths and profiles can be overridden with `AB_REPO`, `AB_CFG`, `AB_CRED` and `AB_LOG`.
+
 ### Layout
 
 ```
 index.js        plugin entry: config, admission, commands, lifecycle
+bots.js         bot-set resolution: flat config and bots[] are one model
 mapping.js      chat key derivation and the durable chat → session map
 agents.js       in-process agent resolution, resume/create, idle eviction
 mattermost.js   Mattermost transport: WebSocket inbound, REST outbound
 outbound.js     session/event → adapter delivery
+approvals.js    approval bridge: card, state machine, idempotency, audit
+navigator.js    session navigator: selection, rendering, switch guards
+redact.js       display-time credential masking and truncation
 markdown.js     reply splitting
 cordis.patch.yml  bundle patch: the loader row and its default config
-scheduler-test/   acceptance suite (isolated harness; see its own README)
+scheduler-test/   acceptance suite for durable jobs (isolated harness)
+feature-test/     acceptance suite for approvals / navigator / multi-bot
 ```
 
 ### Contributing
 
 - Keep session id derivation inside `mapping.js`. Nothing else should build a session id.
-- Keep authorization ahead of anything that could create state.
+- Keep authorization ahead of anything that could create state — including deciding an approval.
+- Answer approvals only for agents this plugin owns, and delegate every other request with `next()`.
 - Prefer queueing over implicit interruption. `/steer` is the explicit path.
 - Add a note here if you introduce a new configuration field.
 

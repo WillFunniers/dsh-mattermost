@@ -1,0 +1,7 @@
+packages:
+  - .
+
+# The DSH host supplies the @deepseek-ai/dsh-* runtime packages at load time.
+# Installing them again here would create a second copy that the plugin never
+# uses and that could drift from the host's API.
+autoInstallPeers: false

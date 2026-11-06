@@ -34,6 +34,9 @@ Mattermost  ──WebSocket──▶  dsh-mattermost  ──▶  DSH Web 进程
 - **空闲 agent 回收** —— 闲置一段时间后释放运行时 agent，同时保留持久化会话。
 - **默认拒绝的授权模型** —— 用户与频道白名单。
 - **机器人环路防护** —— 每频道预算限制机器人之间的往复。
+- **审批桥（Approval Bridge）** —— DSH 原生的一次性审批请求会以 Mattermost 卡片发出，通过原生 `approval/request` 瀑布由表情回应或回复命令决定。失败即拒绝：没有卡片、没有决定，就没有授权。
+- **会话导航（Session Navigator）** —— `/sessions`、`/session`、`/switch` 列出并切换当前对话自己的会话；不会触碰其它线程、其它用户或其它 Bot。
+- **多 Bot** —— 一个插件实例可驱动多个 Mattermost 机器人账号，各自拥有独立 token、WebSocket、状态文件、授权集合与会话命名空间。
 
 ---
 
@@ -227,6 +230,10 @@ unauthorized inbound userId=<id> channelId=<id> reason=unauthorized
 
 机器人也永远不会响应用自己的帖子。
 
+### 报告安全问题
+
+请优先使用本仓库的 GitHub 私密漏洞报告；若未启用，请通过仓库现有的维护者渠道联系。本仓库不公开安全邮箱。
+
 ### 机器人环路防护
 
 两个会互相自动回复的机器人可能无限往复：
@@ -251,36 +258,66 @@ unauthorized inbound userId=<id> channelId=<id> reason=unauthorized
 
 ## 安装
 
-本仓库目前面向 **DSH 内的源码安装**：没有发布 npm 包，没有构建步骤，也没有自身运行时依赖 —— 它的 DSH 导入都从 DSH 安装中解析。
+本仓库是**在 DSH 内以源码安装的插件**，不是独立 Node 应用。它需要：
 
-1. 克隆到固定位置：
+- **DSH 0.2.1-rc.2**：宿主提供声明为 `peerDependencies` 的六个 `@deepseek-ai/dsh-*` 运行时包。
+- **Node.js 24** 与 **pnpm**（已验证的工具链）。
+- 一个由插件自行安装的依赖：`@deepseek-ai/schemastery`（`~3.18.5`）。
+
+插件不会自行安装六个 DSH 运行时 peer 包，DSH 会从自身安装中解析它们。`pnpm-workspace.yaml` 设置 `autoInstallPeers: false`，避免本地安装生成第二份可能不兼容的副本。不要把这些 peer 包加入 profile。
+
+1. 克隆并安装插件自有依赖：
 
    ```bash
    git clone https://github.com/WillFunniers/dsh-mattermost.git
+   cd dsh-mattermost
+   pnpm install --prod --ignore-scripts
    ```
 
-2. 安装到某个 DSH profile。profile 是 `$DSH_HOME/profiles/<name>` 下的一个目录，含 `package.json` 与 `cordis.patch.yml`。
+   这一步只安装 `@deepseek-ai/schemastery`。请在链接 checkout 之前运行：`dsh plugin add` 记录的是 `link:` 依赖，不会安装链接目标的依赖。
 
-   让包可从该 profile 解析，并加入 profile 的 bundle 列表：
+2. 安装到 DSH profile。对于全新的 `DSH_HOME`，最简单的是使用内置 `web` profile：
 
    ```bash
-   ln -s /path/to/dsh-mattermost $DSH_HOME/profiles/<profile>/node_modules/dsh-mattermost
+   dsh plugin --profile web add /path/to/dsh-mattermost
    ```
 
-   然后在 `$DSH_HOME/profiles/<profile>/package.json` 的 `dsh.profile.bundles` 数组中追加 `dsh-mattermost`。
+   另一个 profile 就替换 `web`。新初始化且要启动 Web UI 的 profile，`dsh.profile.bundles` 必须包含 `@deepseek-ai/dsh-base` 与 `@deepseek-ai/dsh-web-app`。
+
+   手动替代（开发）：
+
+   ```bash
+   dsh plugin --profile web list   # 初始化 profile
+   mkdir -p "$DSH_HOME/profiles/web/node_modules"
+   ln -s /path/to/dsh-mattermost "$DSH_HOME/profiles/web/node_modules/dsh-mattermost"
+   # 在 profiles/web/package.json 的 dsh.profile.bundles 中追加 "dsh-mattermost"
+   ```
 
 3. 插件自带的 `cordis.patch.yml` 会插入自己的 loader 行。若要写入 profile 专属配置，从 profile 的 `cordis.patch.yml` 覆盖其 `config`（见下）。
 
 4. 重启 DSH Web，使 profile 被重新读取。
 
-启动后，插件会打印解析后的配置并连接：
+5. 验证激活：
 
-```
-ready (cwd=..., channels=..., allowedUsers=..., botChainMax=5, idleTtlMs=1800000)
-websocket connected
-```
+   ```bash
+   tail -n 20 "$DSH_HOME/mattermost/plugin.log"
+   dsh --profile web --dump-config | grep -A2 'dsh-mattermost'
+   ```
 
-若凭据缺失，插件会保持待机并说明原因，而不会拖垮 DSH。
+   应看到 `apply() entered`、`web approval routing enabled=no`，且没有 `failed to import` / `ERR_MODULE_NOT_FOUND`。若凭据缺失，插件会等待并说明原因，而不会拖垮 DSH。
+
+### 安装排错
+
+- `ERR_MODULE_NOT_FOUND: @deepseek-ai/schemastery`：第 1 步未执行或失败。在 checkout 中运行 `pnpm install --prod --ignore-scripts`。
+- `Cannot find package '@deepseek-ai/dsh-*'`：DSH 宿主不是 0.2.1-rc.2，或没有提供声明的 peer 包。安装匹配的 DSH 版本。
+- `--dump-config` 中没有插件行：它不在 `dsh.profile.bundles` 中；追加它。
+- 其它模块的 `failed to import`：运行干净安装冒烟测试并附上完整日志。
+
+### 干净安装冒烟测试
+
+`feature-test/clean-install-smoke.sh` 会新建临时 `DSH_HOME`，按上面的命令安装 checkout、启动 DSH，并断言插件行已激活且 Web Approval 关闭。它需要 `dsh`、`pnpm` 和 registry 访问；不会读取生产配置或凭据。
+
+已知限制：真实 Mattermost E2E 与 scheduler 套件需要隔离 Mattermost 实例；冒烟测试不会连接。
 
 ---
 
@@ -307,6 +344,12 @@ websocket connected
 | `stateDir` | string | `''` | 状态目录。为空表示 `$DSH_HOME/mattermost`。 |
 | `backfill` | boolean | `true` | 重连后是否回补错过的帖子。 |
 | `maxReplyChars` | number | `12000` | 单条出站消息的最大字符数，超出则拆分。 |
+| `approvalEnabled` | boolean | `true` | 是否从 Mattermost 回应原生审批请求。设为 `false` 时所有请求都会交给下一个 answerer（Web 界面），与本功能存在之前完全一致。它不会覆盖 DSH 自身的策略。 |
+| `approvalTimeoutMs` | number | `300000` | 审批卡片的最长有效时间。无人处理的卡片解析为 `unavailable`，即操作被拒绝。 |
+| `webApproval` | object | 全部关闭 | DSH **Web** 会话发起的审批请求「通知到哪里」。`approvers` 为空即关闭；可裁决卡片仅限一对一私聊。 |
+| `approvalCardArguments` | string | `off` | `off` 时 **Web 来源**卡片不展示工具参数；`masked` 时掩码展示。Mattermost 来源不受影响。 |
+| `navigatorLimit` | number | `8` | `/sessions` 显示的当前对话会话数量上限。 |
+| `bots` | object[] | `[]` | 额外的 Bot 账号。为空表示上面的扁平字段描述的就是唯一的 Bot，见[多 Bot](#多-bot)。 |
 | `debug` | boolean | `false` | 输出更详细的适配器日志。 |
 
 ### 示例
@@ -422,6 +465,97 @@ token 解析顺序：
 ```
 /new
 ```
+
+### Web 来源审批通知（只允许一对一私聊）
+
+DSH **Web** 会话发起的审批请求，主入口始终是浏览器弹窗。插件可以在 Mattermost 里额外提示，但只有一条规则：
+
+> **可裁决的卡片只能发到「经验证的一对一私聊」，且该私聊的唯一对方就是唯一配置的审批人。**
+
+```yaml
+webApproval:
+  channel: ''        # P1  固定会话（频道 id、ch: 或 dm: 键）
+  binding: {}        # P2  { botId: chatKey } 显式指定会话
+  auto: false        # P3  单用户推断
+  ttlMs: 86400000    # 24h —— 会话最多可以「旧」到什么程度
+  approvers: []      # 唯一允许裁决 Web 来源请求的用户
+
+approvalCardArguments: 'off'   # 'off'（默认）或 'masked'，只影响 Web 来源卡片
+```
+
+顺序固定：固定会话 → 每 Bot 显式绑定 → 推断 → 不发。显式目标失效时**直接停**，不会退回到猜测，也不会广播或自动创建私聊。
+
+「是不是一对一」由 Mattermost 的**频道类型 + 成员表**判定，**不看 `dm:` 前缀**：群聊私信是 `type: G`，DM 也可能被拉进第三个人。判定结果：
+
+| 目标 | 结果 |
+| --- | --- |
+| 验证过的一对一 DM，对方 = 审批人 | **可裁决卡片**（✅ / ❌ / `/approve <id>`） |
+| 频道、群聊 DM、线程 | **只有提醒**——不含请求编号、工具名、参数，没有任何裁决入口 |
+| 多个 approvers、对方 ≠ 审批人、成员不可读 | **什么都不发** |
+
+卡片投递失败**不会**决定这次请求：浏览器弹窗照常可用，无人处理时记录自然超时。若浏览器先裁决，卡片会被改写为「已失效」。
+
+`approvers` 必须是 `allowedUsers` 的子集；越界配置在启动时被拒绝，功能保持关闭。**通知目标不是授权**：卡片落在某个会话里，不代表该会话成员有裁决权。
+
+**Mattermost 来源的卡片完全不受影响**：参数掩码展示、风险说明、频道/线程位置全部保持原样。
+
+裁决被拒绝时返回以下错误码之一，均不会自动重试：
+
+| 错误码 | 含义 |
+| --- | --- |
+| `unknown` | 没有这个请求（伪造的 id，或本进程从未见过）。 |
+| `settled` | 已被裁决过——先到者生效。 |
+| `expired` | 已过截止时间，请求以 `unavailable` 关闭。 |
+| `forbidden` | Bot 不匹配，或该 Web 来源卡片并非一对一私聊。 |
+| `not-allowed` | 未获得该 Bot 的授权，或不是该 Web 请求唯一配置的审批人。 |
+| `wrong-channel` | 裁决来自卡片所在会话之外的地方。 |
+| `not-posted` | 该请求从未成功投递过卡片（例如 Web 通知投递失败）。 |
+
+待审批记录只存在于当前进程。插件重启后它们即消失：Mattermost 里仍然可见的旧卡片会变成**孤儿卡片**——任何表情回应或命令都无法再裁决它们，也不会与新的请求发生混淆。
+
+---
+
+## 多 Bot
+
+一个插件实例可以驱动多个 Mattermost 机器人账号。每个 Bot 拥有独立的 token 引用、WebSocket 连接、重连循环、去重/回补状态文件、授权集合、频道白名单与会话键命名空间。
+
+```yaml
+- id: mattermost
+  name: dsh-mattermost
+  config:
+    cwd: /srv/workspace
+    # 扁平字段是每个 Bot 继承的默认值。
+    allowedUsers: ['<user-id>']
+    bots:
+      - id: dsh              # 第一个 Bot：沿用历史键名与 state.json
+        tokenRef: MATTERMOST_TOKEN
+        channels: ['<channel-id>']
+        freeResponseChannels: ['<channel-id>']
+      - id: dsh-ops
+        tokenRef: MATTERMOST_TOKEN_OPS
+        channels: ['<ops-channel-id>']
+        allowedUsers: ['<ops-user-id>']
+```
+
+未填写的字段继承扁平配置。Bot id 仅允许 `[A-Za-z0-9._-]` 且必须唯一；格式错误或重复的 id 会在加载时直接失败，而不是把两个 Bot 静默合并进同一个命名空间。
+
+### 隔离边界
+
+| 层面 | 是否隔离 | 方式 |
+| --- | --- | --- |
+| 凭据 | 是 | 每个 Bot 一个 token 引用。 |
+| 传输 | 是 | 每个 Bot 一条 WebSocket、一套重连与去重/回补游标；断开其中一个不会连带重连其它。 |
+| 会话映射 | 是 | 持久键为 `b<botId>:<chatKey>`，且 bot id 参与 sessionId 的哈希输入，因此同一频道或同一线程下的两个 Bot 绝不会共用会话。 |
+| 授权 | 是 | 每个 Bot 有各自的 `allowedUsers` / `allowAll` / 频道白名单。 |
+| 审批 | 是 | 请求会记录拥有该会话的 Bot；来自其它 Bot 的决定会被拒绝。 |
+| 投递 | 是 | 回复经由拥有该会话的 Bot 发出。 |
+| Agent 运行时 | **否** | 所有 Bot 的 agent 运行在同一个 DSH 进程内，共享相同的工具权限、工作目录与文件系统访问。 |
+
+**这是路由与数据隔离，不是安全沙箱。** 多 Bot 不会为各自的用户提供独立的工具权限或独立的文件系统。请勿把多 Bot 部署描述成安全隔离。
+
+### 升级现有的单 Bot 部署
+
+无需任何操作。第一个配置的 Bot 拥有多 Bot 之前的历史命名空间：存放在裸 `<chatKey>` 下的映射仍会被读取，并在首次使用时被**镜像**（不移动、不删除）到 `b<botId>:<chatKey>`，sessionId、代次与历史原样保留。新对话写入新命名空间。
 
 ---
 
@@ -565,7 +699,7 @@ agent 调用 schedule_job
 
 ## 开发
 
-插件是纯 ESM JavaScript：没有构建步骤、没有打包器、自身没有运行时依赖 —— 对 `@deepseek-ai/*` 包的导入从 DSH 安装中解析。
+插件是纯 ESM JavaScript：没有构建步骤、没有打包器。它有一个自行安装的依赖（`@deepseek-ai/schemastery`）和六个由 DSH 宿主提供的 `@deepseek-ai/dsh-*` peer 包；`node_modules` 不提交到仓库。
 
 `package.json` 声明了 `dsh.bundle.patch` 条目，这才使该包可作为 DSH bundle 加载：
 
@@ -573,23 +707,43 @@ agent 调用 schedule_job
 {
   "type": "module",
   "main": "index.js",
+  "dependencies": { "@deepseek-ai/schemastery": "~3.18.5" },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-credentials": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.1-rc.2"
+  },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
 }
 ```
 
 仓库内没有 lint 或 build 脚本。`scheduler-test/` 存放一套独立的验收套件（自带 README），针对隔离的测试 harness 运行，不属于插件运行时。
 
+### 部署检查脚本
+
+`deploy/preflight.sh` 与 `deploy/verify.sh` 是生产发布用的**只读**检查脚本。`preflight.sh` 检查配置、凭据引用、Bot 身份、待决审批（对白名单频道做完整分页扫描）、Git 基线与提交链、可选 bundle 以及服务状态；`verify.sh` 检查部署后的提交、工作区、配置哈希、服务稳定性、日志、身份与待决审批。两者都输出 `PASS`/`FAIL`/`UNKNOWN`，非 `PASS` 时以非零码退出；它们不会 merge、reset、重启服务或发送 Mattermost 消息——这些动作始终需要人工单独授权。
+
+`deploy/tests/run-tests.sh` 使用本地 mock Mattermost 与临时 Git 仓库运行隔离测试。路径与 profile 可通过 `AB_REPO`、`AB_CFG`、`AB_CRED`、`AB_LOG` 覆盖。
+
 ### 目录结构
 
 ```
 index.js       插件入口：配置、准入、命令、生命周期
+bots.js        Bot 集合解析：扁平配置与 bots[] 是同一个模型
 mapping.js     会话键派生与持久化 chat → session 映射
 agents.js      同进程 agent 解析、恢复/创建、空闲回收
 mattermost.js  Mattermost 传输：WebSocket 入站、REST 出站
 outbound.js    session/event → 适配器投递
+approvals.js   审批桥：卡片、状态机、幂等、审计
+navigator.js   会话导航：选择、渲染、切换守卫
+redact.js      展示期敏感值遮蔽与截断
 markdown.js    回复拆分
 cordis.patch.yml  bundle 补丁：loader 行及其默认配置
-scheduler-test/   验收套件（隔离 harness；见其自带 README）
+scheduler-test/   持久任务验收套件（隔离 harness）
+feature-test/     审批 / 会话导航 / 多 Bot 验收套件
 ```
 
 ### 贡献约定

@@ -14,9 +14,24 @@
  */
 import { splitForCap } from './markdown.js'
 
-export function createOutbound({ logger, client, resolveTarget, maxChars = 12_000 }) {
+export function createOutbound({ logger, client, clientFor, resolveTarget, maxChars = 12_000 }) {
   /** sessionId -> { buffer, turn, delivered } */
   const state = new Map()
+
+  /**
+   * The transport that owns this delivery.
+   *
+   * Routing is by the target's bot id, not by whichever client happens to be
+   * first: with two bots in one channel, using the wrong client would answer as
+   * the wrong identity (and, for a DM, fail outright).
+   */
+  function transportFor(target) {
+    if (typeof clientFor === 'function') {
+      const resolved = clientFor(target && target.botId)
+      if (resolved) return resolved
+    }
+    return client
+  }
 
   function stateFor(sessionId) {
     let s = state.get(sessionId)
@@ -35,6 +50,8 @@ export function createOutbound({ logger, client, resolveTarget, maxChars = 12_00
     const sessionId = String(session.id)
     const target = resolveTarget(sessionId)
     if (!target) return
+    const mm = transportFor(target)
+    if (!mm) return
     const s = stateFor(sessionId)
 
     try {
@@ -43,7 +60,7 @@ export function createOutbound({ logger, client, resolveTarget, maxChars = 12_00
           s.buffer = ''
           s.turn = event.data?.turn ?? s.turn
           s.delivered = 0
-          void client.sendTyping(target.channelId)
+          void mm.sendTyping(target.channelId)
           break
         }
         case 'assistant/message': {
@@ -57,7 +74,7 @@ export function createOutbound({ logger, client, resolveTarget, maxChars = 12_00
           if (raw) {
             const parts = splitForCap(raw, maxChars)
             for (const part of parts) {
-              await client.send(target.channelId, part, target.rootId)
+              await mm.send(target.channelId, part, target.rootId)
             }
             s.delivered += parts.length
           }
@@ -65,9 +82,9 @@ export function createOutbound({ logger, client, resolveTarget, maxChars = 12_00
             const detail = reason.kind === 'aborted' ? '已中断'
               : reason.kind === 'error' ? `出错：${reason.error?.message || reason.error?.code || '未知'}`
               : reason.kind
-            await client.send(target.channelId, `⚠️ 本轮${detail}`, target.rootId)
+            await mm.send(target.channelId, `⚠️ 本轮${detail}`, target.rootId)
           } else if (!raw) {
-            await client.send(target.channelId, '（本轮没有文本输出）', target.rootId)
+            await mm.send(target.channelId, '（本轮没有文本输出）', target.rootId)
           }
           logger.info(`replied session=${sessionId} chars=${raw.length}`)
           s.buffer = ''

@@ -21,6 +21,7 @@
 # that happens, re-run this script (or restart-test.sh) to put the harness back.
 set -u
 MMT_HOME="${MMT_HOME:-$HOME/.dsh-mmt-test}"
+MMT_PROFILE="${MMT_PROFILE:-mmt-test}"
 BIN="${MMT_BIN:?set MMT_BIN to the harness checkout that holds restart-test.sh}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TTL_MS="${TTL_MS:-60000}"
@@ -39,7 +40,7 @@ harness_ttl_ms() {
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
     case "$exe" in */node|*/nodejs) ;; *) continue ;; esac
     cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-    case "$cmd" in *"dsh --profile mmt-test"*) ;; *) continue ;; esac
+    case "$cmd" in *"dsh --profile $MMT_PROFILE"*) ;; *) continue ;; esac
     v=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
         | sed -n 's/^MATTERMOST_IDLE_TTL_MS=//p' | head -1)
     if [ -n "$v" ]; then printf '%s' "$v"; return 0; fi

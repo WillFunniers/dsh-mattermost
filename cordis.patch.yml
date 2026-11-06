@@ -30,6 +30,33 @@
         idleAgentTtlMs: !!js Number(process.env.MATTERMOST_IDLE_TTL_MS || 1800000)
         idleSweepIntervalMs: !!js Number(process.env.MATTERMOST_SWEEP_MS || 60000)
 
+        # Approval Bridge. `MATTERMOST_APPROVAL_ENABLED=0` makes this plugin
+        # decline to answer, so every request falls through to `next()` exactly
+        # as before the feature existed (it never overrides DSH's own policy).
+        approvalEnabled: !!js process.env.MATTERMOST_APPROVAL_ENABLED !== '0'
+        approvalTimeoutMs: !!js Number(process.env.MATTERMOST_APPROVAL_TIMEOUT_MS || 300000)
+        # Whether a WEB-origin card renders the tool arguments ('off' | 'masked').
+        # Mattermost-origin cards are unaffected.
+        approvalCardArguments: !!js process.env.MATTERMOST_APPROVAL_CARD_ARGUMENTS || 'off'
+
+        # Web-origin approval routing (Approval Bridge A1). Every field is empty
+        # or off by default, which means "no announcement" — the browser prompt
+        # alone answers, exactly as before this feature existed.
+        #
+        # `approvers` must be a subset of `allowedUsers`; a configuration that
+        # reaches beyond it is rejected at startup and the feature stays off.
+        webApproval:
+          channel: !!js process.env.MATTERMOST_WEB_APPROVAL_CHANNEL || ''
+          binding: !!js JSON.parse(process.env.MATTERMOST_WEB_APPROVAL_BINDING || '{}')
+          auto: !!js process.env.MATTERMOST_WEB_APPROVAL_AUTO === '1'
+          ttlMs: !!js Number(process.env.MATTERMOST_WEB_APPROVAL_TTL_MS || 86400000)
+          approvers: !!js (process.env.MATTERMOST_WEB_APPROVAL_APPROVERS || '').split(',').filter(Boolean)
+
+        # Multiple bots, as a JSON array of {id, baseUrl, tokenRef, channels,
+        # allowedUsers, ...}. Unset = the flat fields above describe bot #0, so
+        # a single-bot deployment needs no change at all.
+        bots: !!js JSON.parse(process.env.MATTERMOST_BOTS || '[]')
+
         # Empty = $DSH_HOME/mattermost.
         stateDir: !!js process.env.MATTERMOST_STATE_DIR || ''
         backfill: true
